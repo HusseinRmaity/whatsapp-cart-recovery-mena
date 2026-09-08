@@ -1,0 +1,290 @@
+[
+  {
+    "updatedAt": "2026-08-21T07:49:59.273Z",
+    "createdAt": "2026-08-02T09:44:49.078Z",
+    "id": "V4cSnl3LLVV5d1nl",
+    "name": "[CS2 Cart] 00 - Health Check",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "note-anthropic",
+        "name": "Note - Why /v1/models",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -40,
+          60
+        ],
+        "parameters": {
+          "width": 460,
+          "height": 200,
+          "content": "## Anthropic check uses GET /v1/models\n\nDeliberate: it authenticates the API key without generating any tokens.\n\nA Messages call would bill on every health check — and Case 2's budget is $0 additional (CLAUDE.md). A health endpoint that costs money per poll is a health endpoint nobody polls."
+        }
+      },
+      {
+        "id": "note-degraded",
+        "name": "Note - Degraded not failed",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          900,
+          60
+        ],
+        "parameters": {
+          "width": 460,
+          "height": 200,
+          "content": "## One dead service = degraded, not crashed\n\nEvery check runs Continue-On-Fail with timeout 10s + 1 retry, so a single unreachable service still returns a readable report naming which one is down.\n\nIf the whole workflow crashed instead, the operator would learn nothing except 'it broke'."
+        }
+      },
+      {
+        "id": "wh-health",
+        "name": "Receive Health Check",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          0,
+          300
+        ],
+        "parameters": {
+          "httpMethod": "GET",
+          "path": "health-c2",
+          "responseMode": "responseNode"
+        },
+        "webhookId": "2edd3540-db1a-44b9-ab27-bafdf9bcc67c"
+      },
+      {
+        "id": "chk-anthropic",
+        "name": "Check Anthropic API",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          240,
+          300
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://api.anthropic.com/v1/models",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "anthropicApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "anthropic-version",
+                "value": "2023-06-01"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "credentials": {
+          "anthropicApi": {
+            "id": "azRjMcNgGfj9c985",
+            "name": "Anthropic account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "continueOnFail": false,
+        "notes": "Auth check only - zero tokens billed",
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "chk-supabase",
+        "name": "Check Supabase REST",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          480,
+          300
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/send_windows?select=country_code&limit=1",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "continueOnFail": false,
+        "notes": "Reads send_windows - shared table, proves DB reachable",
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "chk-shopify",
+        "name": "Check Shopify Admin API",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          720,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://layla-boutique-5lw7e3c9.myshopify.com/admin/api/2026-07/graphql.json",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpHeaderAuth",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "{\"query\":\"{ shop { name currencyCode } }\"}",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "credentials": {
+          "httpHeaderAuth": {
+            "id": "hupjHLUzjXEln2nz",
+            "name": "Shopify - Case 2"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "continueOnFail": false,
+        "notes": "GraphQL - REST Admin API is legacy since 2024-10",
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "build-response",
+        "name": "Build Health Response",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          960,
+          300
+        ],
+        "parameters": {
+          "jsCode": "function statusOf(nodeName) {\n  try {\n    const item = $(nodeName).first();\n    if (!item) return { status: 'unknown' };\n    const j = item.json || {};\n    if (j.error) {\n      const msg = typeof j.error === 'string' ? j.error : JSON.stringify(j.error);\n      return { status: 'unreachable', detail: msg.slice(0, 200) };\n    }\n    return { status: 'reachable', json: j };\n  } catch (e) {\n    return { status: 'unreachable', detail: String(e && e.message ? e.message : e).slice(0, 200) };\n  }\n}\n\nconst a = statusOf('Check Anthropic API');\nconst s = statusOf('Check Supabase REST');\nconst p = statusOf('Check Shopify Admin API');\n\n// Shopify returns 200 with an errors[] on scope problems - treat that as unreachable\nif (p.status === 'reachable' && p.json && p.json.errors) {\n  p.status = 'unreachable';\n  p.detail = JSON.stringify(p.json.errors).slice(0, 200);\n}\n\nconst shopName = (p.json && p.json.data && p.json.data.shop) ? p.json.data.shop.name : null;\nconst modelCount = (a.json && Array.isArray(a.json.data)) ? a.json.data.length : null;\n\nconst checks = {\n  anthropic: { status: a.status, models_visible: modelCount, detail: a.detail || undefined },\n  supabase:  { status: s.status, detail: s.detail || undefined },\n  shopify:   { status: p.status, store: shopName, detail: p.detail || undefined }\n};\n\nconst allOk = Object.values(checks).every(c => c.status === 'reachable');\n\nreturn [{ json: {\n  status: allOk ? 'ok' : 'degraded',\n  service: 'case-2-abandoned-cart-recovery',\n  timestamp: new Date().toISOString(),\n  checks\n}}];"
+        }
+      },
+      {
+        "id": "respond",
+        "name": "Respond Health Check",
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1,
+        "position": [
+          1200,
+          300
+        ],
+        "parameters": {
+          "respondWith": "allIncomingItems",
+          "options": {}
+        }
+      }
+    ],
+    "connections": {
+      "Receive Health Check": {
+        "main": [
+          [
+            {
+              "node": "Check Anthropic API",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Anthropic API": {
+        "main": [
+          [
+            {
+              "node": "Check Supabase REST",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Supabase REST": {
+        "main": [
+          [
+            {
+              "node": "Check Shopify Admin API",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Shopify Admin API": {
+        "main": [
+          [
+            {
+              "node": "Build Health Response",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Health Response": {
+        "main": [
+          [
+            {
+              "node": "Respond Health Check",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp"
+    },
+    "staticData": null,
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "58b1319e-445a-4b6a-95b9-c10adba25aea",
+    "activeVersionId": "58b1319e-445a-4b6a-95b9-c10adba25aea",
+    "versionCounter": 3,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-02T09:44:49.082Z",
+        "createdAt": "2026-08-02T09:44:49.082Z",
+        "role": "workflow:owner",
+        "workflowId": "V4cSnl3LLVV5d1nl",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

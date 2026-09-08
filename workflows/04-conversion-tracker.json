@@ -1,0 +1,888 @@
+[
+  {
+    "updatedAt": "2026-08-21T07:50:11.452Z",
+    "createdAt": "2026-08-03T21:51:30.996Z",
+    "id": "C2ConvTracker003",
+    "name": "[CS2 Cart] 04 - Conversion Tracker",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "note-conv",
+        "name": "Note - 04 - Conversion Tracker",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -320,
+          -100
+        ],
+        "parameters": {
+          "width": 720,
+          "height": 320,
+          "content": "## 04 - Conversion Tracker\n`orders/create` from Shopify. Turns \"they bought\" from something discovered by the next 15-minute\nsweep into something known within seconds - which matters because the gap is exactly the window in\nwhich we could message a customer who has already paid.\n\nThis does NOT replace the conversion check in workflow 02. That check runs immediately before every\nsend and stays the fail-safe for a webhook that never arrives (a dead tunnel, a Shopify retry that\nexpired, a subscription removed after repeated failures). Two independent paths to the same\nconclusion is the correct shape here: one fast, one reliable.\n\nBoth write the same columns and the same Slack wording, and both are idempotent, so whichever gets\nthere first wins and the second matches 0 rows."
+        }
+      },
+      {
+        "id": "note-hmac",
+        "name": "Note - HMAC over the RAW body",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          440,
+          -100
+        ],
+        "parameters": {
+          "width": 640,
+          "height": 320,
+          "content": "## HMAC is computed over the RAW body\nIdentical front-end to `01 - Checkout Intake`. The webhook runs with **Raw Body ON**, so the\npayload arrives as binary and the Crypto node hashes the exact bytes Shopify signed.\n\nRe-serialising parsed JSON would change key order and whitespace and produce a different digest -\nthe classic Shopify HMAC bug. The body is therefore decoded and parsed in ONE place,\n`Parse Order Payload`, and only after the signature has been verified.\n\nThe secret lives in the `Shopify HMAC - Case 2` credential (type `crypto`, field `hmacSecret`),\nnot in an env var - Code nodes cannot read the credential store, which is why the native Crypto\nnode is used instead of computing this by hand (decisions.md 2026-08-02).\n\nThis is a public endpoint receiving commerce data. An unsigned request is logged as a security\nevent and dropped."
+        }
+      },
+      {
+        "id": "note-attrib",
+        "name": "Note - Honest attribution",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1780,
+          -100
+        ],
+        "parameters": {
+          "width": 680,
+          "height": 320,
+          "content": "## Honest attribution (locked decision #9)\n| Cart state when the order lands | Result |\n|---|---|\n| touches_sent > 0 | `recovered` - we messaged them, then they bought |\n| touches_sent = 0 | `converted_before_first_touch` - **no credit claimed** |\n| already `recovered` / `converted_before_first_touch` | no write, no second Slack |\n| `opted_out` | no status change, logged as `converted_after_opt_out` |\n\nA customer who asked us to stop and then bought anyway is not a recovery, and overwriting their\nopt-out with a success status would also destroy the suppression flag. The order is recorded in\nthe run log instead, and Slack says plainly that no credit is claimed.\n\n`recovered_amount` stores Shopify's **shop_money** (what the merchant books) with\n`recovered_currency` beside it, because `carts.currency` holds the **presentment** currency the\ncustomer saw. A Lebanese customer pays 42,663,000 LBP against an order the merchant books as\n1,747.75 AED - without the second column the row reads \"1747.75 LBP\"."
+        }
+      },
+      {
+        "id": "wh-order",
+        "name": "Receive Shopify Order Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          -320,
+          440
+        ],
+        "webhookId": "c2a10d54-6f31-4a6e-9d1e-2f0b7a1c9e03",
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "shopify-order",
+          "options": {
+            "rawBody": true
+          }
+        },
+        "notes": "Raw Body ON - required for HMAC. Responds 200 immediately (Shopify needs <5s)."
+      },
+      {
+        "id": "verify-hmac",
+        "name": "Verify Shopify HMAC",
+        "type": "n8n-nodes-base.crypto",
+        "typeVersion": 2,
+        "position": [
+          -100,
+          440
+        ],
+        "parameters": {
+          "action": "hmac",
+          "binaryData": true,
+          "dataPropertyName": "computed_hmac",
+          "encoding": "base64"
+        },
+        "credentials": {
+          "crypto": {
+            "id": "LMvshWz5rH1vvwkP",
+            "name": "Shopify HMAC - Case 2"
+          }
+        },
+        "notes": "Hashes raw bytes with hmacSecret from the crypto credential"
+      },
+      {
+        "id": "if-hmac",
+        "name": "Is Signature Valid",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          120,
+          440
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "hmac-match",
+                "leftValue": "={{ $json.computed_hmac }}",
+                "rightValue": "={{ $('Receive Shopify Order Webhook').item.json.headers['x-shopify-hmac-sha256'] }}",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-hmac-fail",
+        "name": "Log HMAC Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          660
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '04 - Conversion Tracker', execution_id: $execution.id, cart_id: null, status: 'failed', step_name: 'hmac_fail', error_message: 'HMAC mismatch - request dropped', metadata: { source_ip: $('Receive Shopify Order Webhook').item.json.headers['x-forwarded-for'] || null, shop_domain: $('Receive Shopify Order Webhook').item.json.headers['x-shopify-shop-domain'] || null, topic: $('Receive Shopify Order Webhook').item.json.headers['x-shopify-topic'] || null } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Security event - unsigned/forged request"
+      },
+      {
+        "id": "drop-unverified",
+        "name": "Drop Unverified Request",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          560,
+          660
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "parse-order",
+        "name": "Parse Order Payload",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          340,
+          440
+        ],
+        "parameters": {
+          "jsCode": "const wh = $('Receive Shopify Order Webhook').first();\n\n// Decode the raw body we just verified. Parsed here and ONLY here, so nothing\n// upstream can re-serialise the bytes the signature was computed over.\nlet raw = '';\ntry {\n  const bin = wh.binary && wh.binary.data;\n  if (bin && bin.data) raw = Buffer.from(bin.data, 'base64').toString('utf8');\n} catch (e) { /* fall through */ }\nif (!raw && wh.json && wh.json.body) {\n  raw = typeof wh.json.body === 'string' ? wh.json.body : JSON.stringify(wh.json.body);\n}\n\nlet p = {};\nlet parse_error = null;\ntry { p = JSON.parse(raw); } catch (e) { parse_error = String(e.message || e); }\n\nfunction clean(v) {\n  if (v == null) return null;\n  const s = String(v).trim();\n  return s.length ? s : null;\n}\n\n// shop_money is what the MERCHANT books; presentment_money is what the customer\n// saw. carts.currency holds presentment, carts.recovered_currency holds shop -\n// they are genuinely different numbers and conflating them misreports revenue.\nconst tps = p.total_price_set || {};\nconst shop = tps.shop_money || {};\nconst pres = tps.presentment_money || {};\n\nconst checkoutToken = clean(p.checkout_token);\n\nreturn [{ json: {\n  parse_error: parse_error,\n  checkout_token: checkoutToken,\n  has_checkout_token: !!checkoutToken,\n  // Prefer the GraphQL gid so this matches what workflow 02 writes for the same order.\n  order_id: clean(p.admin_graphql_api_id) || (p.id != null ? String(p.id) : null),\n  order_ref: clean(p.name),\n  order_created_at: clean(p.created_at),\n  financial_status: clean(p.financial_status),\n  shop_amount: (shop.amount !== undefined && shop.amount !== null) ? Number(shop.amount) : (p.total_price != null ? Number(p.total_price) : null),\n  shop_currency: clean(shop.currency_code) || clean(p.currency),\n  presentment_amount: (pres.amount !== undefined && pres.amount !== null) ? Number(pres.amount) : null,\n  presentment_currency: clean(pres.currency_code) || clean(p.presentment_currency),\n  customer_phone: clean(p.phone) || clean((p.customer || {}).phone) || null,\n  shop_domain: wh.json && wh.json.headers ? (wh.json.headers['x-shopify-shop-domain'] || null) : null\n} }];"
+        },
+        "notes": "Decodes the verified bytes; separates shop money from presentment money"
+      },
+      {
+        "id": "if-token",
+        "name": "Has Checkout Token",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          560,
+          440
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-token",
+                "leftValue": "={{ $json.has_checkout_token }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-no-token",
+        "name": "Log Order Without Token",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          780,
+          660
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '04 - Conversion Tracker', execution_id: $execution.id, cart_id: null, status: $json.parse_error ? 'failed' : 'success', step_name: 'order_without_checkout_token', error_message: $json.parse_error ? ('order payload could not be parsed: ' + $json.parse_error) : null, metadata: { order_ref: $json.order_ref, order_id: $json.order_id, action: 'ignored', reason: 'draft/POS/API order with no checkout_token - nothing to attribute' } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Not every order comes from a tracked checkout - that is normal, not an error"
+      },
+      {
+        "id": "match-cart",
+        "name": "Match Cart By Checkout Token",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          780,
+          440
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "*"
+              },
+              {
+                "name": "checkout_token",
+                "value": "=eq.{{ $json.checkout_token }}"
+              },
+              {
+                "name": "limit",
+                "value": "1"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "checkout_token is unique - the same key that makes the intake upsert safe"
+      },
+      {
+        "id": "classify-attrib",
+        "name": "Classify Attribution",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1000,
+          440
+        ],
+        "parameters": {
+          "jsCode": "const order = $('Parse Order Payload').first().json;\nconst resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst body = resp ? resp.body : null;\n\nconst lookupOk = (httpCode === 200 && Array.isArray(body));\nconst cart = (lookupOk && body.length > 0) ? body[0] : null;\n\n// Statuses this workflow is allowed to close. Anything else is either already\n// closed (nothing to do) or opted out (must not be overwritten).\nconst OPEN = ['pending_verification', 'abandoned', 'recovering', 'exhausted'];\nconst CLOSED = ['recovered', 'converted_before_first_touch'];\n\nlet outcome = 'no_match';\nlet closeStatus = null;\n\nif (!lookupOk) {\n  outcome = 'lookup_failed';\n} else if (cart) {\n  if (cart.opted_out === true || cart.status === 'opted_out') {\n    // They asked us to stop and bought anyway. That is a sale, not a recovery,\n    // and overwriting the status here would also destroy the suppression flag.\n    outcome = 'converted_after_opt_out';\n  } else if (CLOSED.indexOf(cart.status) >= 0) {\n    // The 15-minute sweep already attributed this one, or Shopify retried the\n    // webhook. Either way there is nothing left to write.\n    outcome = 'already_closed';\n  } else if (OPEN.indexOf(cart.status) >= 0) {\n    outcome = 'attribute';\n    // Locked decision #9: a cart that converted before we ever messaged it is\n    // NOT a recovery and must never be counted as one.\n    closeStatus = (cart.touches_sent || 0) > 0 ? 'recovered' : 'converted_before_first_touch';\n  } else {\n    outcome = 'unexpected_status';\n  }\n}\n\nreturn [{ json: {\n  outcome: outcome,\n  close_status: closeStatus,\n  lookup_ok: lookupOk,\n  lookup_status_code: httpCode,\n  cart_id: cart ? cart.id : null,\n  cart_status: cart ? cart.status : null,\n  touches_sent: cart ? cart.touches_sent : null,\n  customer_first_name: cart ? cart.customer_first_name : null,\n  customer_last_name: cart ? cart.customer_last_name : null,\n  cart_currency: cart ? cart.currency : null,\n  cart_total: cart ? cart.cart_total : null,\n  checkout_token: order.checkout_token,\n  order_id: order.order_id,\n  order_ref: order.order_ref,\n  shop_amount: order.shop_amount,\n  shop_currency: order.shop_currency,\n  presentment_amount: order.presentment_amount,\n  presentment_currency: order.presentment_currency\n} }];"
+        },
+        "notes": "recovered vs converted_before_first_touch decided here, by touches_sent"
+      },
+      {
+        "id": "route-outcome",
+        "name": "Route Attribution Outcome",
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3,
+        "position": [
+          1220,
+          440
+        ],
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-attribute",
+                      "leftValue": "={{ $json.outcome }}",
+                      "rightValue": "attribute",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "attribute"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-nomatch",
+                      "leftValue": "={{ $json.outcome }}",
+                      "rightValue": "no_match",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "no_match"
+              }
+            ],
+            "fallbackOutput": "extra"
+          },
+          "options": {
+            "fallbackOutput": "extra"
+          }
+        },
+        "notes": "Fallback carries already_closed / opted_out / lookup_failed"
+      },
+      {
+        "id": "close-cart",
+        "name": "Close Recovered Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1500,
+          300
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $json.cart_id }}"
+              },
+              {
+                "name": "status",
+                "value": "not.in.(recovered,converted_before_first_touch,opted_out)"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ status: $json.close_status, next_touch_at: null, recovered_order_id: $json.order_id, recovered_amount: $json.shop_amount, recovered_currency: $json.shop_currency }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Status filter makes a webhook retry or a sweep race a 0-row no-op"
+      },
+      {
+        "id": "slack-conv",
+        "name": "Notify Slack Conversion",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1720,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Attribution').first().json; var patch = $input.first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; var name = [c.customer_first_name, c.customer_last_name].filter(Boolean).join(' ') || '(no name)'; var amt = (c.shop_amount !== null && c.shop_amount !== undefined) ? c.shop_amount.toLocaleString('en-US') : '?'; var cur = c.shop_currency || ''; var ref = c.order_ref || 'order'; var text = (c.close_status === 'recovered') ? ('\\ud83d\\udcb0 Recovered ' + amt + ' ' + cur + ' \\u2014 ' + name + ', after touch ' + c.touches_sent + ' (' + ref + ')') : ('\\u2705 ' + name + ' checked out before any message was sent \\u2014 ' + amt + ' ' + cur + ' (' + ref + '). No recovery claimed.'); return { channel: '#leads', text: text }; })()) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Same wording as workflow 02, so both paths read identically"
+      },
+      {
+        "id": "log-attrib",
+        "name": "Log Attribution",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1940,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Attribution').first().json; var patch = $('Close Recovered Cart').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; var row = (Array.isArray(pb) && pb[0]) ? pb[0] : null; var slack = $('Notify Slack Conversion').first().json; var sb = (slack && slack.body) ? slack.body : slack; var slackOk = !!(sb && sb.ok); return { workflow_name: '04 - Conversion Tracker', execution_id: $execution.id, cart_id: c.cart_id, status: (rows === 1 && slackOk) ? 'success' : 'partial', step_name: 'conversion_attributed', error_message: rows === 1 ? null : 'cart update matched 0 rows - already closed by the sweep or a webhook retry', metadata: { checkout_token: c.checkout_token, close_status: c.close_status, touches_sent: c.touches_sent, status_before: c.cart_status, order_id: c.order_id, order_ref: c.order_ref, recovered_amount: c.shop_amount, recovered_currency: c.shop_currency, presentment_amount: c.presentment_amount, presentment_currency: c.presentment_currency, cart_presentment_currency: c.cart_currency, rows_updated: rows, next_touch_at: row ? row.next_touch_at : null, slack_ok: slackOk, source: 'orders_create_webhook' } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-unmatched",
+        "name": "Log Unmatched Order",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1500,
+          520
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '04 - Conversion Tracker', execution_id: $execution.id, cart_id: null, status: 'success', step_name: 'order_not_tracked', metadata: { checkout_token: $json.checkout_token, order_ref: $json.order_ref, order_id: $json.order_id, amount: $json.shop_amount, currency: $json.shop_currency, action: 'ignored', reason: 'no cart with this checkout_token - a normal order we never tracked' } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Most orders on a real store land here - it is the normal case"
+      },
+      {
+        "id": "log-nochange",
+        "name": "Log No Attribution Change",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1500,
+          740
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '04 - Conversion Tracker', execution_id: $execution.id, cart_id: $json.cart_id, status: $json.outcome === 'lookup_failed' ? 'failed' : 'success', step_name: $json.outcome, error_message: $json.outcome === 'lookup_failed' ? ('cart lookup returned HTTP ' + $json.lookup_status_code + ' - workflow 02 will still catch this conversion on its next sweep') : null, metadata: { checkout_token: $json.checkout_token, order_ref: $json.order_ref, order_id: $json.order_id, status_before: $json.cart_status, touches_sent: $json.touches_sent, amount: $json.shop_amount, currency: $json.shop_currency, action: 'no_write', reason: $json.outcome === 'already_closed' ? 'already attributed by the sweep or a duplicate webhook' : ($json.outcome === 'converted_after_opt_out' ? 'customer opted out then bought - a sale, not a recovery, and the suppression flag must survive' : 'unexpected cart status') } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "already_closed / converted_after_opt_out / lookup_failed all land here"
+      }
+    ],
+    "connections": {
+      "Receive Shopify Order Webhook": {
+        "main": [
+          [
+            {
+              "node": "Verify Shopify HMAC",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Verify Shopify HMAC": {
+        "main": [
+          [
+            {
+              "node": "Is Signature Valid",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Signature Valid": {
+        "main": [
+          [
+            {
+              "node": "Parse Order Payload",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log HMAC Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log HMAC Failure": {
+        "main": [
+          [
+            {
+              "node": "Drop Unverified Request",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Order Payload": {
+        "main": [
+          [
+            {
+              "node": "Has Checkout Token",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Has Checkout Token": {
+        "main": [
+          [
+            {
+              "node": "Match Cart By Checkout Token",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Order Without Token",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Match Cart By Checkout Token": {
+        "main": [
+          [
+            {
+              "node": "Classify Attribution",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Classify Attribution": {
+        "main": [
+          [
+            {
+              "node": "Route Attribution Outcome",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Attribution Outcome": {
+        "main": [
+          [
+            {
+              "node": "Close Recovered Cart",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Unmatched Order",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log No Attribution Change",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Close Recovered Cart": {
+        "main": [
+          [
+            {
+              "node": "Notify Slack Conversion",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Notify Slack Conversion": {
+        "main": [
+          [
+            {
+              "node": "Log Attribution",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "saveExecutionProgress": true,
+      "saveManualExecutions": true
+    },
+    "staticData": null,
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "957cfaa5-6a50-4659-a282-f2ebc4253939",
+    "activeVersionId": "957cfaa5-6a50-4659-a282-f2ebc4253939",
+    "versionCounter": 3,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-03T21:51:31.003Z",
+        "createdAt": "2026-08-03T21:51:31.003Z",
+        "role": "workflow:owner",
+        "workflowId": "C2ConvTracker003",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

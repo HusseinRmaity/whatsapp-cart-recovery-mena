@@ -1,0 +1,217 @@
+[
+  {
+    "updatedAt": "2026-08-21T07:50:15.816Z",
+    "createdAt": "2026-08-04T14:56:44.312Z",
+    "id": "9zn3PbSKb9dPxNqp",
+    "name": "[CS2 Cart] 99 - Error Handler",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "error-trigger",
+        "name": "On Workflow Error",
+        "type": "n8n-nodes-base.errorTrigger",
+        "typeVersion": 1,
+        "position": [
+          0,
+          300
+        ],
+        "parameters": {},
+        "notes": "Global error trigger for CASE 2 only. Fires when 00 / 01 / 02 / 03r / 03 / 04 (each naming this workflow as its Error Workflow) throws an UNHANDLED error. Case 1 keeps its own handler (8lWcGsY178OA0ePk) - the two are deliberately separate so this repo ships standalone."
+      },
+      {
+        "id": "build-error-report",
+        "name": "Build Error Report",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          220,
+          300
+        ],
+        "parameters": {
+          "jsCode": "const t = $json || {};\nconst ex = t.execution || {};\nconst wf = t.workflow || {};\nconst err = ex.error || {};\nconst wfName = wf.name || 'unknown workflow';\nconst wfId = wf.id != null ? String(wf.id) : null;\nconst execId = ex.id != null ? String(ex.id) : null;\nconst execUrl = ex.url || null;\nconst lastNode = ex.lastNodeExecuted || '(unknown node)';\nconst errName = err.name || 'Error';\nconst errMsg = (err.message != null ? String(err.message) : 'no message').slice(0, 900);\nconst mode = ex.mode || '';\n\n// cart_id stays null on purpose. The Error Trigger payload carries execution and\n// workflow metadata only - it does not expose the item that was in flight, so any\n// cart id written here would be a guess. The execution URL is the honest link back\n// to the failing run, and the run_logs row is findable by execution_id.\nconst run_log = {\n  workflow_name: wfName,\n  execution_id: execId,\n  cart_id: null,\n  status: 'failed',\n  step_name: 'workflow_error',\n  error_message: (errName + ': ' + errMsg).slice(0, 1000),\n  metadata: {\n    case: 'case-2',\n    last_node: lastNode,\n    error_name: errName,\n    mode: mode,\n    workflow_id: wfId,\n    execution_url: execUrl\n  }\n};\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: 'Workflow failure - Case 2 (abandoned cart)', emoji: false } },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: '*Workflow:*\\n' + wfName },\n    { type: 'mrkdwn', text: '*Failed node:*\\n' + lastNode },\n    { type: 'mrkdwn', text: '*Error type:*\\n' + errName },\n    { type: 'mrkdwn', text: '*Execution:*\\n' + (execId || '-') }\n  ]},\n  { type: 'section', text: { type: 'mrkdwn', text: '*Message:*\\n```' + errMsg + '```' } }\n];\nif (execUrl) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '<' + execUrl + '|Open execution>' }] });\n\nconst slack_body = {\n  channel: '#automation-errors',\n  text: 'Case 2 workflow failure in ' + wfName + ' (' + errName + ')',\n  blocks: blocks\n};\n\nreturn [{ json: { run_log, slack_body } }];"
+        },
+        "notes": "Parses the Error Trigger payload into a run_logs 'failed' row (cart_id null - see comment) plus a #automation-errors Block Kit alert. metadata.case = 'case-2' so one shared run_logs table stays queryable per project."
+      },
+      {
+        "id": "log-failure",
+        "name": "Log Failure To Supabase",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          440,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.run_log) }}",
+          "options": {
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            },
+            "timeout": 10000
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true,
+        "notes": "Persists the crash to run_logs (status=failed). Continue-On-Fail + neverError so a Supabase blip never stops the Slack alert - the alert is the part a human actually sees."
+      },
+      {
+        "id": "alert-errors",
+        "name": "Alert Errors Channel",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          660,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Build Error Report').item.json.slack_body) }}",
+          "options": {
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            },
+            "timeout": 15000
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 4,
+        "waitBetweenTries": 3000,
+        "alwaysOutputData": true,
+        "notes": "Immediate crash alert to #automation-errors via chat.postMessage (bot token). 4 tries / 3s / 15s timeout - same hardening as every other Slack call in this build, against intermittent egress resets."
+      },
+      {
+        "id": "sticky-99",
+        "name": "Note - global error handler (Case 2)",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -40,
+          80
+        ],
+        "parameters": {
+          "width": 680,
+          "height": 220,
+          "content": "## 99 - Global Error Handler (Case 2)\nFires ONLY on an UNHANDLED crash in `00`, `01`, `02`, `03r`, `03`, `04` - each names this workflow as its Error Workflow. Writes a `run_logs` row (status=failed, metadata.case=case-2) and alerts #automation-errors.\n\n**What does NOT reach here, by design:** Shopify / Anthropic / Twilio / Supabase / Slack failures inside the main flows are all Continue-On-Fail. They degrade gracefully, write their own `run_logs` row (`conversion_check_failed`, `twilio_send_failed`, `touch_deferred_send_window`...), and are surfaced by **`02`'s sweep-summary alert** and the **`05` daily digest** - not by a crash alert.\n\nCase 1 keeps its own handler (`8lWcGsY178OA0ePk`). Two handlers, not one, so this case study ships as a standalone repo."
+        }
+      }
+    ],
+    "connections": {
+      "On Workflow Error": {
+        "main": [
+          [
+            {
+              "node": "Build Error Report",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Error Report": {
+        "main": [
+          [
+            {
+              "node": "Log Failure To Supabase",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Failure To Supabase": {
+        "main": [
+          [
+            {
+              "node": "Alert Errors Channel",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all"
+    },
+    "staticData": null,
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "e7301954-3fdf-4178-92b1-0051fabf99c7",
+    "activeVersionId": "e7301954-3fdf-4178-92b1-0051fabf99c7",
+    "versionCounter": 1,
+    "triggerCount": 0,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-04T14:56:44.320Z",
+        "createdAt": "2026-08-04T14:56:44.320Z",
+        "role": "workflow:owner",
+        "workflowId": "9zn3PbSKb9dPxNqp",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

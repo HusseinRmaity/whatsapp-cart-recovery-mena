@@ -1,0 +1,50 @@
+# ── Internal / sensitive — NOT for the public portfolio repo ─────────────────
+# Reasons: live secrets, credential IDs, internal pricing, and working notes.
+#
+# docs/decisions.md      will hold live webhook tokens + n8n credential IDs
+# docs/testing-log.md    internal QA notes + instance references
+# docs/OWNERS-GUIDE.md   internal rate card, client pitch, and build status
+# docs/arabic-style-guide-internal.md
+#                        full Arabic QA log: build-time narratives, testing-log
+#                        citations, and the open items awaiting the owner's ruling.
+#                        prompts/arabic-style-guide.md is the public edition of it.
+# CLAUDE.md              internal working standards + personal tooling references
+# PLAN.md                internal build playbook (credential IDs, deferred notes)
+# case-study-2-spec.md   contains rate-card / pricing (business-sensitive, §9)
+# docs/system-overview.md
+#                        plain-language architecture reference (2026-09-01). Names the live store
+#                        handle and cross-references the ignored internal docs, so it is internal
+#                        until someone decides otherwise. README.md + docs/case-study.md are the
+#                        public-facing explanations.
+#
+# If you want the rigor showcases public, ask for REDACTED copies of
+# decisions.md / testing-log.md instead of un-ignoring these.
+docs/decisions.md
+docs/testing-log.md
+docs/OWNERS-GUIDE.md
+docs/arabic-style-guide-internal.md
+CLAUDE.md
+PLAN.md
+case-study-2-spec.md
+docs/system-overview.md
+
+# ── Secrets (belt-and-suspenders) ────────────────────────────────────────────
+# Shopify Admin API tokens (shpat_*) and webhook signing secrets live ONLY in
+# the n8n credential store — never in a tracked file, never in a workflow JSON,
+# never in a URL. Same rule as the Twilio/Anthropic keys in Case 1.
+.env
+.env.*
+*.pem
+*secret*
+*credentials*
+*.myshopify.com*
+shpat_*
+
+# ── OS / editor cruft ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,766 @@
+[
+  {
+    "updatedAt": "2026-08-31T19:36:53.360Z",
+    "createdAt": "2026-08-02T09:55:03.012Z",
+    "id": "UjPjVhfipiOw88s2",
+    "name": "[CS2 Cart] 01 - Checkout Intake",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "content": "## HMAC is computed over the RAW body\n\nThe webhook runs with **Raw Body ON**, so the payload arrives as binary and the Crypto node hashes those exact bytes.\n\n**Never hash re-serialised JSON.** Parsing and re-stringifying changes key order, spacing and unicode escaping, so the digest stops matching and every legitimate Shopify delivery gets rejected. That is the classic Shopify HMAC bug.\n\nSecret lives in the `crypto` credential (hmacSecret) — not in the code, not in an env var.",
+          "height": 260,
+          "width": 520
+        },
+        "id": "note-hmac",
+        "name": "Note - Raw body HMAC",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -64,
+          -48
+        ]
+      },
+      {
+        "parameters": {
+          "content": "## Shopify re-fires on EVERY cart edit\n\nSo the write goes through `case2_upsert_cart()` — one atomic statement keyed on checkout_token.\n\nIt updates cart CONTENTS and deliberately never touches `next_touch_at`, `touches_sent`, `status` or `opted_out`. Otherwise a customer fiddling with their cart would slide the schedule forward forever and never get a message — and an opted-out customer could be resurrected.\n\nProven by 10 DB-level checks, see testing-log 2026-08-02.",
+          "height": 260,
+          "width": 520
+        },
+        "id": "note-idem",
+        "name": "Note - Idempotency",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1648,
+          -48
+        ]
+      },
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "shopify-checkout",
+          "options": {
+            "rawBody": true
+          }
+        },
+        "id": "wh-checkout",
+        "name": "Receive Shopify Checkout Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          0,
+          400
+        ],
+        "webhookId": "993b0203-334f-46b3-b1e5-bc0a411f9bbd",
+        "notes": "Raw Body ON - required for HMAC. Responds 200 immediately (Shopify needs <5s)."
+      },
+      {
+        "parameters": {
+          "action": "hmac",
+          "binaryData": true,
+          "dataPropertyName": "computed_hmac",
+          "encoding": "base64"
+        },
+        "id": "verify-hmac",
+        "name": "Verify Shopify HMAC",
+        "type": "n8n-nodes-base.crypto",
+        "typeVersion": 2,
+        "position": [
+          240,
+          400
+        ],
+        "credentials": {
+          "crypto": {
+            "id": "LMvshWz5rH1vvwkP",
+            "name": "Shopify HMAC - Case 2"
+          }
+        },
+        "notes": "Hashes raw bytes with hmacSecret from the crypto credential"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "hmac-match",
+                "leftValue": "={{ $json.computed_hmac }}",
+                "rightValue": "={{ $('Receive Shopify Checkout Webhook').item.json.headers['x-shopify-hmac-sha256'] }}",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "if-hmac",
+        "name": "Is Signature Valid",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          480,
+          400
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '01 - Checkout Intake', execution_id: $execution.id, status: 'failed', step_name: 'hmac_fail', error_message: 'HMAC mismatch - request dropped', metadata: { source_ip: $('Receive Shopify Checkout Webhook').item.json.headers['x-forwarded-for'] || null, shop_domain: $('Receive Shopify Checkout Webhook').item.json.headers['x-shopify-shop-domain'] || null, topic: $('Receive Shopify Checkout Webhook').item.json.headers['x-shopify-topic'] || null } }) }}",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "id": "log-hmac-fail",
+        "name": "Log HMAC Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          720,
+          592
+        ],
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true,
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "notes": "Security event - unsigned/forged request"
+      },
+      {
+        "parameters": {},
+        "id": "drop-req",
+        "name": "Drop Unverified Request",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          960,
+          592
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const wh = $('Receive Shopify Checkout Webhook').first();\n\n// Decode the raw body we just verified. Parse it here and ONLY here.\nlet raw = '';\ntry {\n  const bin = wh.binary && wh.binary.data;\n  if (bin && bin.data) raw = Buffer.from(bin.data, 'base64').toString('utf8');\n} catch (e) { /* fall through */ }\nif (!raw && wh.json && wh.json.body) {\n  raw = typeof wh.json.body === 'string' ? wh.json.body : JSON.stringify(wh.json.body);\n}\n\nlet p = {};\nlet parse_error = null;\ntry { p = JSON.parse(raw); } catch (e) { parse_error = String(e.message || e); }\n\n// Shopify sends shipping_address / billing_address as [] before the customer\n// reaches the address step, and as an object afterwards. Normalise both.\nfunction addr(v) { return Array.isArray(v) ? (v[0] || {}) : (v || {}); }\nconst sa = addr(p.shipping_address);\nconst ba = addr(p.billing_address);\nconst cu = p.customer || {};\nconst da = cu.default_address || {};\n\n// Shopify sends \" \" (a single space) for an unset name - not null.\nfunction clean(v) {\n  if (v == null) return null;\n  const s = String(v).trim();\n  return s.length ? s : null;\n}\n\n// Phone can arrive in any of these. Checking only p.phone is the mistake that\n// makes every checkout look like it has no phone.\nconst countryFromAddress = clean(sa.country_code) || clean(ba.country_code) || clean(da.country_code);\n\nconst rawPhone = p.phone || cu.phone || sa.phone || ba.phone || da.phone || null;\n\n// Shopify hands the phone back in NATIONAL format (\"03 123 456\"), not E.164.\n// The old version just prepended '+', which turned a Beirut national number\n// into a syntactically valid JAPANESE one. It passed the regex, was\n// stored, and every touch would have been delivered nowhere. So the country\n// dial code has to come from the address when the number is not already\n// international, and if we cannot determine it we return null and let the\n// no-phone branch handle it rather than invent a recipient.\nconst DIAL_BY_CC = { AE:'971', SA:'966', QA:'974', KW:'965', BH:'973', OM:'968',\n                     JO:'962', LB:'961', MA:'212', TN:'216', DZ:'213', EG:'20',\n                     GB:'44', FR:'33', US:'1', CA:'1' };\n\nlet phone_source = 'none';\nfunction toE164(v, cc) {\n  if (!v) return null;\n  let s = String(v).trim().replace(/[\\s()\\-\\.]/g, '');\n\n  // Reject anything that is not digits/'+' BEFORE stripping. Shopify's own test\n  // payload uses '555-555-SHIP'; silently deleting the letters would turn it\n  // into the plausible-looking +1555555 instead of rejecting it (M2 test 6).\n  if (/[^\\d+]/.test(s)) { phone_source = 'invalid_characters'; return null; }\n\n  let intl = false;\n  if (s.startsWith('+')) { intl = true; s = s.slice(1); }\n  else if (s.startsWith('00')) { intl = true; s = s.slice(2); }\n  s = s.replace(/\\D/g, '');\n  if (!s) return null;\n\n  if (intl) {\n    phone_source = 'already_international';\n  } else {\n    const dial = DIAL_BY_CC[String(cc || '').toUpperCase()];\n    if (!dial) { phone_source = 'unresolved_no_country'; return null; }\n    if (s.startsWith(dial) && s.length >= dial.length + 7) {\n      phone_source = 'country_code_present_without_plus';\n    } else {\n      s = dial + s.replace(/^0+/, '');   // drop the national trunk prefix\n      phone_source = 'prefixed_from_address_country';\n    }\n  }\n\n  const out = '+' + s;\n  if (!/^\\+[1-9]\\d{6,14}$/.test(out)) { phone_source = 'invalid_after_normalise'; return null; }\n  return out;\n}\nconst phone = toE164(rawPhone, countryFromAddress);\n\nconst items = Array.isArray(p.line_items) ? p.line_items.map(li => ({\n  title: clean(li.title) || clean(li.presentment_title),\n  quantity: li.quantity || 1,\n  price: li.price != null ? Number(li.price) : null,\n  image_url: li.image_url || (li.image && li.image.src) || null\n})) : [];\n\nreturn [{ json: {\n  parse_error,\n  checkout_token: p.token || p.checkout_token || null,\n  cart_token: p.cart_token || null,\n  // The checkouts webhook carries NO numeric id. `name` (#38913415086339) is\n  // the reference an operator can actually search for in the Shopify admin.\n  shopify_checkout_id: p.id != null ? String(p.id) : clean(p.name),\n  first_name: clean(cu.first_name) || clean(sa.first_name) || clean(ba.first_name) || clean(da.first_name),\n  last_name:  clean(cu.last_name)  || clean(sa.last_name)  || clean(ba.last_name)  || clean(da.last_name),\n  phone,\n  raw_phone: rawPhone,\n  email: clean(p.email) || clean(cu.email),\n  // The field is customer_locale, NOT locale. Reading p.locale silently\n  // discarded the only language hint Shopify gives us.\n  locale: clean(p.customer_locale) || clean(p.locale),\n  cart_items: items,\n  cart_total: p.total_price != null ? Number(p.total_price) : null,\n  // total_price and the line-item prices are in the PRESENTMENT currency - what\n  // the customer actually saw. Pairing them with p.currency (the SHOP currency)\n  // stored a 734 USD cart as \"734 AED\", and an LBP cart as \"35246000 AED\".\n  currency: p.presentment_currency || p.currency || null,\n  shop_currency: p.currency || null,\n  recovery_url: p.abandoned_checkout_url || null,\n  country_from_address: countryFromAddress,\n  phone_source,\n  item_count: items.length\n}}];"
+        },
+        "id": "parse-payload",
+        "name": "Parse Checkout Payload",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          720,
+          320
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "has-token",
+                "leftValue": "={{ $json.checkout_token }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              },
+              {
+                "id": "has-phone",
+                "leftValue": "={{ $json.phone }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "if-valid",
+        "name": "Validate Required Fields",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          960,
+          320
+        ],
+        "notes": "No phone = unrecoverable on a WhatsApp-only channel"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '01 - Checkout Intake', execution_id: $execution.id, status: 'partial', step_name: $json.checkout_token ? 'no_phone_skip' : 'no_token_skip', error_message: $json.parse_error || null, metadata: { checkout_token: $json.checkout_token, raw_phone: $json.raw_phone, email: $json.email, item_count: $json.item_count } }) }}",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "id": "log-skip",
+        "name": "Log Skipped Checkout",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1200,
+          512
+        ],
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true,
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {},
+        "id": "end-skip",
+        "name": "End - Not Recoverable",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          1440,
+          512
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const d = $json;\n\n// Longest prefix first - +97 would otherwise swallow +971.\nconst DIAL = [\n  ['+971','AE','Asia/Dubai','ar'],\n  ['+966','SA','Asia/Riyadh','ar'],\n  ['+974','QA','Asia/Qatar','ar'],\n  ['+965','KW','Asia/Kuwait','ar'],\n  ['+973','BH','Asia/Bahrain','ar'],\n  ['+968','OM','Asia/Muscat','ar'],\n  ['+962','JO','Asia/Amman','ar'],\n  ['+961','LB','Asia/Beirut','ar'],\n  ['+212','MA','Africa/Casablanca','fr'],\n  ['+216','TN','Africa/Tunis','fr'],\n  ['+213','DZ','Africa/Algiers','fr'],\n  ['+20','EG','Africa/Cairo','ar'],\n  ['+44','GB','Europe/London','en'],\n  ['+33','FR','Europe/Paris','fr'],\n  ['+1','US','America/New_York','en']\n];\n\nconst phone = d.phone || '';\nlet country = null, timezone = null, country_lang = null;\nlet timezone_source = null;\nfor (const [pre, cc, tz, lang] of DIAL) {\n  if (phone.startsWith(pre)) { country = cc; timezone = tz; country_lang = lang; timezone_source = 'phone_prefix'; break; }\n}\n\n// Defence in depth. Previously, if the phone matched no prefix the country fell\n// back to the address but the TIMEZONE stayed null - and a null timezone makes\n// the send-window gate in workflow 02 default a Beirut customer to Asia/Dubai.\n// Derive both from the address country using the same table.\nconst BY_CC = {};\nfor (const [pre, cc, tz, lang] of DIAL) { if (!BY_CC[cc]) BY_CC[cc] = { tz: tz, lang: lang }; }\n\nif (!country && d.country_from_address) country = String(d.country_from_address).toUpperCase();\nif (country) country = String(country).toUpperCase();\n\nif (!timezone && country && BY_CC[country]) {\n  timezone = BY_CC[country].tz;\n  timezone_source = 'address_country';\n  if (!country_lang) country_lang = BY_CC[country].lang;\n}\n\nconst name = [d.first_name, d.last_name].filter(Boolean).join(' ');\nconst hasArabicScript = /[؀-ۿݐ-ݿ]/.test(name);\n\n// customer_locale looks like 'ar', 'en-GB', 'fr-FR'\nlet localeLang = null;\nif (d.locale) {\n  const base = String(d.locale).toLowerCase().split('-')[0];\n  if (['ar','en','fr'].includes(base)) localeLang = base;\n}\n\n// ORDER MATTERS, and 'en' locale is deliberately demoted.\n// customer_locale reflects the storefront language the shopper browsed in. A\n// single-language English store reports en-US for EVERY customer, including a\n// Dubai shopper who would rather be messaged in Arabic. So a NON-English locale\n// is a strong signal (they actively chose it) while 'en' is weak and loses to\n// phone country. Getting this backwards makes every MENA customer English.\nlet language = null, language_source = null;\nif (hasArabicScript)                        { language = 'ar';        language_source = 'name_script'; }\nelse if (localeLang && localeLang !== 'en') { language = localeLang;  language_source = 'shopify_locale'; }\nelse if (country_lang)                      { language = country_lang; language_source = 'phone_country'; }\nelse if (localeLang === 'en')               { language = 'en';        language_source = 'shopify_locale_en'; }\nelse                                        { language = null;        language_source = 'ambiguous'; }\n\n// ---------------------------------------------------------------------------\n// GENDER - for Arabic verb/pronoun agreement only.\n//\n// Ruled by Hussein 2026-08-07: arabic-master-reference.md section 5 \"Gender agreement\"\n// applies to Case 2 outbound, so workflow 02's blanket ban on\n// 2nd-person-feminine forms becomes conditional on who the customer is. That\n// needs a signal, and it belongs HERE: one inference per customer, made sticky\n// by case2_upsert_cart, so the register cannot change between touch 1 and 3.\n//\n// Deliberately HIGH-PRECISION. 'unknown' is a correct answer and routes the\n// model to gender-neutral phrasing (arabic-master-reference.md prefers rephrasing over\n// guessing); a WRONG guess produces visibly wrong Arabic on a real handset,\n// which is worse than neutral. Anything not confidently matched goes to Haiku,\n// and if Haiku is unreachable it stays 'unknown'.\n// ---------------------------------------------------------------------------\nfunction inferGender(rawFirst) {\n  let raw = String(rawFirst === null || rawFirst === undefined ? '' : rawFirst).trim();\n  if (!raw) return { gender: 'unknown', source: 'no_name' };\n\n  // First token only - Arabic family names carry no reliable gender signal.\n  raw = raw.split(/[\\s \\-_.]+/)[0];\n\n  // Strip tashkeel and unify hamza carriers so the two spellings of Asmaa hit\n  // one entry. Alef-maqsura is NOT folded into ya: that ending is itself a signal.\n  const ar = raw.replace(/[ً-ْٰ]/g, '').replace(/[أإآ]/g, 'ا');\n  const lat = raw.toLowerCase().replace(/[^a-z]/g, '');\n\n  // Checked FIRST: genuinely unisex names. Forcing one of these to a gender is\n  // the single most likely way to address a real person wrongly.\n  const AMBIGUOUS_AR = ['نور','ايمان','امل','بيان','وعد','جهاد','صباح','سلام'];\n  const AMBIGUOUS_LAT = ['nour','noor','nur','iman','eman','amal','bayan','jihad','sabah',\n    'salam','sam','alex','jordan','taylor','chris','robin','jamie','morgan','casey'];\n  if (AMBIGUOUS_AR.indexOf(ar) !== -1 || AMBIGUOUS_LAT.indexOf(lat) !== -1) {\n    return { gender: 'unknown', source: 'unisex_name' };\n  }\n\n  // Exact lists beat the ending rules below. That ordering is load-bearing:\n  // Usama, Hamza, Talha, Ubayda, Muawiya all end in ta-marbuta and are MALE,\n  // and Mustafa, Yahya, Musa, Isa, Murtada all end in alef-maqsura and are\n  // MALE. Ending rules alone would misgender every one of them.\n  const MALE_AR = ['محمد','احمد','علي','عمر','خالد','سعيد','حسن','حسين','يوسف','ابراهيم',\n    'عبدالله','عبد','فهد','سلطان','ماجد','طارق','سامي','رامي','زياد','كريم','وليد','ياسر',\n    'فادي','جورج','الياس','مروان','بشار','نبيل','هاني','عادل','انور','باسل','حاتم','رائد',\n    'شادي','صالح','سمير','منير','جمال','كمال','نضال','عماد','عصام','فراس','غسان','ايمن',\n    'بلال','انس','سيف','فيصل','ناصر','سالم','حمد','راشد','منصور','رمزي','وسام','شربل',\n    'انطوان','بيار','طوني','روي',\n    'مصطفى','يحيى','موسى','عيسى','مرتضى',\n    'اسامة','حمزة','طلحة','عبيدة','معاوية',\n    'ضياء','علاء','بهاء','زكريا','رضا'];\n\n  const FEMALE_AR = ['مريم','زينب','رنا','ريم','هند','ندى','سحر','شهد','رغد','رشا','دينا',\n    'منال','ابتسام','احلام','اسيل','هيا','دارين','كارين','ياسمين','نسرين','شيرين','سوسن',\n    'سمر','سهام','سعاد','سلوى','وداد','عبير','اماني','اروى','رولا','ربى','بتول','تالا',\n    'لارا','جنان','شذى','ميس','لين','جود','ملك','رهف','بشرى','نهى','مها','منى','غادة'];\n\n  const MALE_LAT = ['mohammed','mohamed','muhammad','mohammad','ahmed','ahmad','ali','omar',\n    'umar','khaled','khalid','hassan','hasan','hussein','hussain','youssef','yousef','yusuf',\n    'joseph','ibrahim','abdullah','abdallah','abdul','fahad','fahd','majed','majid','tarek',\n    'tariq','tarik','sami','rami','ziad','karim','kareem','walid','yasser','yaser','fadi',\n    'george','georges','elias','marwan','bashar','nabil','hani','adel','anwar','basel',\n    'bassel','hatem','raed','shadi','saleh','mustafa','moustafa','yahya','moussa','musa',\n    'issa','reda','zakaria','diaa','alaa','bahaa','samir','mounir','jamal','kamal','nidal',\n    'imad','issam','firas','ghassan','ayman','osama','hamza','bilal','anas','saif','faisal',\n    'sultan','nasser','salem','hamad','rashid','mansour','ramzi','wissam','charbel','antoine',\n    'pierre','tony','roy','john','david','michael','james','robert','william','thomas',\n    'daniel','paul','peter','mark','jean','luc','marc'];\n\n  const FEMALE_LAT = ['sara','sarah','layla','laila','leila','lina','lena','mariam','maryam',\n    'mary','marie','fatima','fatma','fatema','aisha','aicha','huda','hoda','salma','zeinab',\n    'zainab','reem','rim','rana','nada','farah','ghada','mona','mouna','samira','nadia',\n    'hala','dima','dana','hind','maya','yasmin','yasmine','jasmine','rita','joelle','carine',\n    'karine','rasha','dina','manal','ahlam','asil','haya','darine','nesrine','chirine',\n    'sawsan','samar','siham','souad','salwa','widad','abeer','amani','arwa','rula','ruba',\n    'batoul','tala','lara','shaza','mais','leen','joud','malak','rahaf','boushra','noha',\n    'maha','asma','asmaa','doaa','esraa','shaimaa','wafaa','rajaa','sanaa','ghaida',\n    'najwa','lubna','zahra','zahraa','jana','emma','olivia','sophia','sophie','julie',\n    'laura','anna','elena','claire'];\n\n  if (MALE_AR.indexOf(ar) !== -1 || MALE_LAT.indexOf(lat) !== -1) {\n    return { gender: 'male', source: 'name_list' };\n  }\n  if (FEMALE_AR.indexOf(ar) !== -1 || FEMALE_LAT.indexOf(lat) !== -1) {\n    return { gender: 'female', source: 'name_list' };\n  }\n\n  // Arabic morphology, applied only AFTER the exception lists above.\n  if (/[؀-ۿ]/.test(ar)) {\n    if (/ة$/.test(ar))           return { gender: 'female', source: 'ta_marbuta' };\n    if (/اء$/.test(ar))     return { gender: 'female', source: 'alef_hamza_ending' };\n    if (/ى$/.test(ar))           return { gender: 'female', source: 'alef_maqsura' };\n  }\n\n  // No Latin ending rule: a trailing 'a' is a weak signal at best and would\n  // misgender Mustafa, Musa, Zakaria and Yahya on the first cart it saw.\n  return { gender: 'unknown', source: 'no_match' };\n}\n\nconst g = inferGender(d.first_name);\n\n// Haiku is asked only when the answer would actually change a message.\n// Language ambiguous -> always ask (we cannot yet tell whether it will be\n// Arabic). Gender unknown -> ask ONLY for Arabic carts: agreement is\n// meaningless in en/fr, and a call per cart that changes nothing is a real\n// bill on a client's account.\nlet needs_ai = false, ai_reason = null;\nif (language === null) {\n  needs_ai = true; ai_reason = 'language';\n} else if ((language === 'ar' || language === 'mixed') && g.gender === 'unknown') {\n  needs_ai = true; ai_reason = 'gender';\n}\n\nreturn [{ json: { ...d, country_code: country, timezone, timezone_source,\n  language, language_source,\n  customer_gender: g.gender, gender_source: g.source,\n  needs_ai, ai_reason, customer_name: name || null } }];"
+        },
+        "id": "detect-locale",
+        "name": "Detect Language And Timezone",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1200,
+          272
+        ],
+        "notes": "Heuristic chain: name script > Shopify locale > phone country. Plus gender from a name heuristic. Haiku only if language is still unresolved, or gender is unknown on an Arabic cart."
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "needs-ai",
+                "leftValue": "={{ $json.needs_ai }}",
+                "rightValue": true,
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "if-ai",
+        "name": "Needs AI Language Check",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1440,
+          272
+        ],
+        "notes": "True when language is unresolved OR (Arabic cart AND gender unknown)."
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.anthropic.com/v1/messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "anthropicApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "anthropic-version",
+                "value": "2023-06-01"
+              },
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 32, system: 'Reply with ONLY a compact JSON object, no prose and no code fences: {\"language\":\"ar|en|fr\",\"gender\":\"female|male|unknown\"}. language = which language to message this customer in. gender = the likely grammatical gender of the given first name, used for Arabic verb agreement. Answer \"unknown\" for gender unless you are confident - a wrong guess is worse than no guess.', messages: [{ role: 'user', content: 'Customer name: ' + ($json.customer_name || 'unknown') + '. Email: ' + ($json.email || 'unknown') + '. Country: ' + ($json.country_code || 'unknown') + '. Asked because: ' + ($json.ai_reason || 'unknown') }] }) }}",
+          "options": {
+            "timeout": 15000
+          }
+        },
+        "id": "ai-lang",
+        "name": "Classify Language With Haiku",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1680,
+          192
+        ],
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true,
+        "credentials": {
+          "anthropicApi": {
+            "id": "azRjMcNgGfj9c985",
+            "name": "Anthropic account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "notes": "Haiku 4.5, 32 max_tokens, returns {language, gender}. Fallback only - most carts never reach this node, and gender-only calls fire for ARABIC carts alone."
+      },
+      {
+        "parameters": {
+          "jsCode": "const base = $('Detect Language And Timezone').first().json;\nlet language = base.language;\nlet source = base.language_source;\nlet gender = base.customer_gender || 'unknown';\nlet gender_source = base.gender_source || null;\n\nif (base.needs_ai) {\n  try {\n    const ai = $('Classify Language With Haiku').first().json;\n    const text = ai && ai.content && ai.content[0] && ai.content[0].text;\n\n    // The prompt asks for JSON, but a model that wraps it in prose or a code\n    // fence must not cost us the whole answer - take the first {...} block.\n    let parsed = null;\n    if (text) {\n      const m = String(text).match(/\\{[\\s\\S]*\\}/);\n      if (m) { try { parsed = JSON.parse(m[0]); } catch (e) { parsed = null; } }\n    }\n\n    // LANGUAGE: applied only when the heuristic chain had NO answer. Haiku is a\n    // fallback, not a second opinion - a resolved heuristic always wins, which\n    // matters now that needs_ai can be true for gender reasons alone.\n    if (base.language === null) {\n      let guess = null;\n      if (parsed) guess = String(parsed.language || '').trim().toLowerCase().slice(0, 2);\n      // Tolerate the pre-2026-08-07 bare-token reply shape ('ar').\n      if (!guess && text) guess = String(text).trim().toLowerCase().slice(0, 2);\n      if (['ar','en','fr'].includes(guess)) { language = guess; source = 'haiku'; }\n    }\n\n    // GENDER: applied only when the heuristic said unknown. 'unknown' from the\n    // model is kept as unknown - it is a real answer, not a failure.\n    if (gender === 'unknown' && parsed) {\n      const gg = String(parsed.gender || '').trim().toLowerCase();\n      if (['female','male'].includes(gg)) { gender = gg; gender_source = 'haiku'; }\n    }\n  } catch (e) {\n    // Haiku unreachable - keep both heuristic answers. Silence over a guess.\n  }\n}\n\n// Last resort. English is the safest neutral default for an unknown MENA\n// customer: wrong-language Arabic reads worse than neutral English.\nif (!language) { language = 'en'; source = 'default_fallback'; }\n\n// 'unknown' is a first-class value all the way to the database: workflow 02\n// reads it and tells the model to use gender-neutral phrasing rather than pick.\nif (!gender) { gender = 'unknown'; gender_source = gender_source || 'no_match'; }\n\nreturn [{ json: { ...base, language, language_source: source,\n  customer_gender: gender, gender_source } }];"
+        },
+        "id": "merge-lang",
+        "name": "Resolve Final Language",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1920,
+          272
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/rpc/case2_upsert_cart",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ p_checkout_token: $json.checkout_token, p_shopify_checkout_id: $json.shopify_checkout_id, p_first_name: $json.first_name, p_last_name: $json.last_name, p_phone: $json.phone, p_email: $json.email, p_language: $json.language, p_country_code: $json.country_code, p_timezone: $json.timezone, p_customer_gender: $json.customer_gender, p_cart_items: $json.cart_items, p_cart_total: $json.cart_total, p_currency: $json.currency, p_recovery_url: $json.recovery_url, p_delay_minutes: 45 }) }}",
+          "options": {
+            "timeout": 15000
+          }
+        },
+        "id": "upsert-cart",
+        "name": "Upsert Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2160,
+          272
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "alwaysOutputData": true,
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "notes": "Atomic upsert - never resets the touch schedule"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ (() => { const up = Array.isArray($json) ? $json[0] : $json; const src = $('Resolve Final Language').first().json; const failed = !up || !up.id; return JSON.stringify({ workflow_name: '01 - Checkout Intake', execution_id: $execution.id, cart_id: failed ? null : up.id, status: failed ? 'failed' : 'success', step_name: failed ? 'upsert_failed' : (up.was_inserted ? 'cart_created' : 'cart_updated'), error_message: failed ? 'case2_upsert_cart returned no row' : null, metadata: { checkout_token: src.checkout_token, language: src.language, language_source: src.language_source, customer_gender: src.customer_gender, gender_source: src.gender_source, ai_reason: src.ai_reason || null, country_code: src.country_code, timezone: src.timezone, timezone_source: src.timezone_source, phone_source: src.phone_source, shop_currency: src.shop_currency, cart_total: src.cart_total, currency: src.currency, item_count: src.item_count, next_touch_at: failed ? null : up.next_touch_at } }); })() }}",
+          "options": {
+            "timeout": 10000
+          }
+        },
+        "id": "log-intake",
+        "name": "Log Intake Run",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2400,
+          272
+        ],
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true,
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput"
+      },
+      {
+        "id": "if-log-skip",
+        "name": "Is Skip Worth Logging",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1200,
+          660
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "has-raw-phone",
+                "leftValue": "={{ $json.raw_phone }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              },
+              {
+                "id": "has-email",
+                "leftValue": "={{ $json.email }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "or"
+          },
+          "options": {}
+        },
+        "notes": "Only log skips the operator can act on"
+      },
+      {
+        "id": "947d6113-0217-4d75-bbb3-107a2110968b",
+        "name": "Note - Gender inference",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1060,
+          -48
+        ],
+        "parameters": {
+          "height": 300,
+          "width": 540,
+          "content": "## Gender is inferred ONCE, here — not per touch\n\nWorkflow 02 relaxes its Arabic feminine-form rules for a customer we know to be **female** (arabic-master-reference.md §5, ruled 2026-08-07). That safety depends on this signal being right.\n\n**Why intake and not the sender:** gender is a property of the customer, so it must not change between touch 1 and touch 3. `case2_upsert_cart` makes it sticky on exactly the same terms as locale — correctable while `touches_sent = 0`, frozen after.\n\n**`unknown` is a correct answer.** It asks the model for gender-neutral phrasing and keeps the checker strict. A wrong guess is visible to a native speaker on a real handset; neutral phrasing never is.\n\n**The trap:** the ة / اء / ى endings say \"feminine\", but أسامة، حمزة، مصطفى، يحيى، ضياء are all male. Explicit name lists are therefore checked BEFORE the morphology rules. Latin script has no ending rule at all — a trailing \"a\" would misgender Mustafa and Zakaria.\n\nHaiku is asked only for **Arabic** carts with an unrecognised name: agreement is meaningless in en/fr and a paid call that changes nothing is a real client bill."
+        }
+      }
+    ],
+    "connections": {
+      "Receive Shopify Checkout Webhook": {
+        "main": [
+          [
+            {
+              "node": "Verify Shopify HMAC",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Verify Shopify HMAC": {
+        "main": [
+          [
+            {
+              "node": "Is Signature Valid",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Signature Valid": {
+        "main": [
+          [
+            {
+              "node": "Parse Checkout Payload",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log HMAC Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log HMAC Failure": {
+        "main": [
+          [
+            {
+              "node": "Drop Unverified Request",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Checkout Payload": {
+        "main": [
+          [
+            {
+              "node": "Validate Required Fields",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Validate Required Fields": {
+        "main": [
+          [
+            {
+              "node": "Detect Language And Timezone",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Is Skip Worth Logging",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Skipped Checkout": {
+        "main": [
+          [
+            {
+              "node": "End - Not Recoverable",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Detect Language And Timezone": {
+        "main": [
+          [
+            {
+              "node": "Needs AI Language Check",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Needs AI Language Check": {
+        "main": [
+          [
+            {
+              "node": "Classify Language With Haiku",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Resolve Final Language",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Classify Language With Haiku": {
+        "main": [
+          [
+            {
+              "node": "Resolve Final Language",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Resolve Final Language": {
+        "main": [
+          [
+            {
+              "node": "Upsert Cart",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Upsert Cart": {
+        "main": [
+          [
+            {
+              "node": "Log Intake Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Skip Worth Logging": {
+        "main": [
+          [
+            {
+              "node": "Log Skipped Checkout",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "End - Not Recoverable",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp",
+      "binaryMode": "separate"
+    },
+    "staticData": null,
+    "meta": {
+      "templateCredsSetupCompleted": true
+    },
+    "nodeGroups": [],
+    "pinData": {},
+    "versionId": "6626f035-8c88-45f2-9ba4-9c106dabd73a",
+    "activeVersionId": "6626f035-8c88-45f2-9ba4-9c106dabd73a",
+    "versionCounter": 19,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-02T09:55:03.017Z",
+        "createdAt": "2026-08-02T09:55:03.017Z",
+        "role": "workflow:owner",
+        "workflowId": "UjPjVhfipiOw88s2",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

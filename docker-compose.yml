@@ -1,0 +1,41 @@
+# Case Study 2 — n8n runtime
+#
+# The build itself runs a single shared n8n instance (Case 1 and Case 2 live side
+# by side in it). This file is here so the repo stands alone: it starts an n8n
+# equivalent to the one this system was built and tested on.
+#
+#   docker compose up -d
+#   open http://localhost:5678  →  import everything in workflows/
+#
+# No secrets in this file, by design. Every credential — Supabase, Anthropic,
+# Twilio, Slack, the Shopify Admin API token, and the Shopify webhook signing
+# secret — lives in n8n's encrypted credential store and is referenced by name
+# from the imported workflows.
+#
+# The webhook signing secret in particular is a `crypto` credential
+# ("Shopify HMAC - Case 2", field `hmacSecret`) read by the native Crypto node,
+# NOT an environment variable. An earlier version of this build did use an env
+# var; its value silently drifted out of sync with the real signing secret and
+# cost a test round chasing a phantom concurrency bug. A dead credential that
+# still looks authoritative is worse than no credential at all.
+#
+# GENERIC_TIMEZONE is the instance's own clock, used by the Schedule triggers
+# (the 15-minute sweep and the 08:00 digest). Customer-facing send windows are
+# resolved per cart from `send_windows` / the cart's own timezone and do NOT
+# depend on this value.
+
+services:
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: N8N
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=Asia/Beirut
+      - TZ=Asia/Beirut
+    volumes:
+      - N8N_DATA:/home/node/.n8n
+
+volumes:
+  N8N_DATA:

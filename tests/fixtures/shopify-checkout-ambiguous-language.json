@@ -1,0 +1,45 @@
+{
+  "id": 38913415099999,
+  "token": "REPLACE_CHECKOUT_TOKEN",
+  "cart_token": "REPLACE_CART_TOKEN",
+  "email": "m.mueller@example.com",
+  "created_at": "2026-08-07T12:00:00+04:00",
+  "updated_at": "2026-08-07T12:00:00+04:00",
+  "customer_locale": "de-DE",
+  "currency": "AED",
+  "presentment_currency": "EUR",
+  "total_price": "410.00",
+  "phone": "+491701234567",
+  "customer": {
+    "id": 7104839999,
+    "first_name": "Max",
+    "last_name": "Mueller",
+    "email": "m.mueller@example.com",
+    "phone": "+491701234567"
+  },
+  "shipping_address": {
+    "first_name": "Max",
+    "last_name": "Mueller",
+    "address1": "Hauptstrasse 4",
+    "city": "Berlin",
+    "country": "Germany",
+    "country_code": "DE",
+    "phone": "+491701234567"
+  },
+  "billing_address": {
+    "first_name": "Max",
+    "last_name": "Mueller",
+    "city": "Berlin",
+    "country_code": "DE",
+    "phone": "+491701234567"
+  },
+  "line_items": [
+    {
+      "title": "Silk Scarf",
+      "quantity": 1,
+      "price": "410.00",
+      "image": { "src": "https://cdn.shopify.com/s/files/1/0000/0000/products/scarf.jpg" }
+    }
+  ],
+  "abandoned_checkout_url": "https://layla-boutique-5lw7e3c9.myshopify.com/checkouts/cn/REPLACE_CHECKOUT_TOKEN/recover?key=0000000000000000"
+}

@@ -1,0 +1,2509 @@
+[
+  {
+    "updatedAt": "2026-09-03T12:26:58.654Z",
+    "createdAt": "2026-08-02T22:24:30.780Z",
+    "id": "Ego90ZQGHf48Awe9",
+    "name": "[CS2 Cart] 02 - Verifier & Touch Sender",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "trg-sched",
+        "name": "Every 15 Minutes",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          -260,
+          380
+        ],
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "minutes",
+                "minutesInterval": 15
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "trg-manual",
+        "name": "Run Sweep Now (Testing)",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          -260,
+          560
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "cfg",
+        "name": "Set Sweep Config",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -40,
+          460
+        ],
+        "parameters": {
+          "jsCode": "// ============================ TEST MODE =====================================\n// Flip TEST_MODE_FLAG to true ONLY while testing, and set it back to false.\n//\n// It is deliberately AND-ed with the execution mode below. A production run\n// (the 15-minute Schedule Trigger) reports mode 'production', so even if this\n// flag is left true by mistake, the scheduled sweep can NEVER bypass a send\n// window or a prayer-time delay and message a real customer at 3am. Only a\n// manual run from the editor can.\n// ============================================================================\nconst TEST_MODE_FLAG = false;\n\nconst mode = $execution.mode;                 // 'test' (manual) | 'production'\nconst TEST_MODE = TEST_MODE_FLAG && mode !== 'production';\n\nreturn [{ json: {\n  test_mode: TEST_MODE,\n  test_mode_flag: TEST_MODE_FLAG,\n  execution_mode: mode,\n\n  // Pagination cap (global standard #8: no unbounded pagination).\n  batch_limit: 50,\n\n  // Gap to the NEXT touch, in minutes, keyed by the touch just sent.\n  // Live: touch 1 -> +24h, touch 2 -> +48h (spec 5: T+45min / T+24h / T+72h).\n  // Test: 10-minute gaps so a full 3-touch sequence is observable in 20 min.\n  next_gap_minutes: TEST_MODE ? { '1': 10, '2': 10 } : { '1': 1440, '2': 2880 },\n\n  // Twilio failure back-off (spec 5: push +2h and retry next sweep).\n  send_failure_backoff_minutes: TEST_MODE ? 5 : 120,\n\n  // Static demo discount for touch 2 (locked decision #7 - dynamic codes are a\n  // client upsell). MUST exist in the Shopify store before the M6 demo.\n  discount_code: 'LAYLA10',\n\n  store_name: 'Layla Boutique',\n  slack_channel: '#leads'\n} }];"
+        },
+        "notes": "TEST_MODE is hard-gated to manual executions"
+      },
+      {
+        "id": "fetch",
+        "name": "Fetch Due Carts",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          180,
+          460
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/rpc/case2_due_carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ p_limit: $json.batch_limit }) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Due + active + not opted out, AND not a suppressed PHONE, LIMIT 50.\n\nWas a GET on /carts until 2026-09-02. PostgREST cannot express \"and this phone is not in another table\", so the queue is now the case2_due_carts RPC, which carries the anti-join against case2_suppressions. Returns setof carts, so Prepare Cart Queue sees the same row shape it always did.\n\nWhy the queue and not a per-cart check: a customer who opts out may hold several carts, and may create NEW ones afterwards. Filtering at the queue is the only place that covers both without every future sender having to remember."
+      },
+      {
+        "id": "queue",
+        "name": "Prepare Cart Queue",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          400,
+          460
+        ],
+        "parameters": {
+          "jsCode": "const resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst body = resp ? resp.body : null;\n\n// A failed fetch is NOT \"no carts are due\" - it is an unknown state. Emit a\n// single failure marker so it gets logged, and send nothing this sweep.\nif (httpCode !== 200 || !Array.isArray(body)) {\n  return [{ json: {\n    _fetch_failed: true,\n    status_code: httpCode,\n    detail: JSON.stringify(body === null || body === undefined ? {} : body).slice(0, 300)\n  } }];\n}\n\n// Genuinely nothing due: return zero items so the sweep ends silently.\n// Logging every empty 15-minute sweep would write ~96 noise rows a day.\nif (body.length === 0) return [];\n\nreturn body.map(function (c, i) {\n  return { json: Object.assign({}, c, {\n    _fetch_failed: false,\n    _queue_index: i + 1,\n    _queue_size: body.length,\n    touch_number: (c.touches_sent || 0) + 1\n  }) };\n});"
+        }
+      },
+      {
+        "id": "if-fetch",
+        "name": "Did Fetch Fail",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          620,
+          460
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-fetchfail",
+                "leftValue": "={{ $json._fetch_failed }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-fetch-fail",
+        "name": "Log Fetch Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          840,
+          640
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: null, status: 'failed', step_name: 'fetch_due_carts_failed', error_message: ('Supabase carts fetch returned ' + $json.status_code + ': ' + $json.detail).slice(0, 1000), metadata: { status_code: $json.status_code } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "loop",
+        "name": "Loop Over Carts",
+        "type": "n8n-nodes-base.splitInBatches",
+        "typeVersion": 3,
+        "position": [
+          860,
+          380
+        ],
+        "parameters": {
+          "batchSize": 1,
+          "options": {}
+        }
+      },
+      {
+        "id": "sweep-done",
+        "name": "Sweep Complete",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          1080,
+          200
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "check-conv",
+        "name": "Check Conversion On Shopify",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1080,
+          440
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://layla-boutique-5lw7e3c9.myshopify.com/admin/api/2026-07/graphql.json",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpHeaderAuth",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ query: \"query($q: String!) { orders(first: 1, query: $q) { edges { node { id name createdAt totalPriceSet { shopMoney { amount currencyCode } } } } } }\", variables: { q: 'checkout_token:' + $json.checkout_token } }) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "httpHeaderAuth": {
+            "id": "hupjHLUzjXEln2nz",
+            "name": "Shopify - Case 2"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "GraphQL Admin API 2026-07; checkout_token is a search filter"
+      },
+      {
+        "id": "classify-conv",
+        "name": "Classify Conversion Result",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1300,
+          440
+        ],
+        "parameters": {
+          "jsCode": "const cart = $('Loop Over Carts').first().json;\nconst resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst body = resp ? resp.body : null;\n\n// THE FAIL-SAFE (locked decision #4). Three distinct states, never two:\n//   converted        -> close the cart, no message\n//   not_converted    -> proven safe to message\n//   skip_api_failure -> UNKNOWN. Send nothing, retry next sweep.\n// Shopify returns HTTP 200 with an `errors` array on a scope problem, so a\n// naive check would read a permissions failure as \"no orders found\" and\n// message a customer who already paid.\nlet outcome = 'skip_api_failure';\nlet detail = null;\nlet order = null;\n\nif (httpCode === 200 && body && !body.errors && body.data && body.data.orders) {\n  const edges = body.data.orders.edges || [];\n  if (edges.length > 0) {\n    outcome = 'converted';\n    const n = edges[0].node || {};\n    const money = (n.totalPriceSet && n.totalPriceSet.shopMoney) ? n.totalPriceSet.shopMoney : {};\n    order = {\n      id: n.id || null,\n      name: n.name || null,\n      amount: (money.amount !== undefined && money.amount !== null) ? Number(money.amount) : null,\n      currency: money.currencyCode || cart.currency || null\n    };\n  } else {\n    outcome = 'not_converted';\n  }\n} else if (body && body.errors) {\n  detail = ('graphql_errors: ' + JSON.stringify(body.errors)).slice(0, 300);\n} else {\n  detail = ('http_' + httpCode + ' ' + JSON.stringify(body === null || body === undefined ? {} : body)).slice(0, 300);\n}\n\n// Honest attribution (locked decision #9): a cart that converted before we ever\n// messaged it is NOT a recovery and must never be counted as one.\nconst closeStatus = (cart.touches_sent || 0) > 0 ? 'recovered' : 'converted_before_first_touch';\n\nreturn [{ json: Object.assign({}, cart, {\n  outcome: outcome,\n  conversion_detail: detail,\n  order: order,\n  close_status: closeStatus\n}) }];"
+        },
+        "notes": "converted / not_converted / skip_api_failure - never guess"
+      },
+      {
+        "id": "route-conv",
+        "name": "Route Conversion Outcome",
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3,
+        "position": [
+          1520,
+          440
+        ],
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-converted",
+                      "leftValue": "={{ $json.outcome }}",
+                      "rightValue": "converted",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "converted"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-not_converted",
+                      "leftValue": "={{ $json.outcome }}",
+                      "rightValue": "not_converted",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "not_converted"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-skip_api_failure",
+                      "leftValue": "={{ $json.outcome }}",
+                      "rightValue": "skip_api_failure",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "skip_api_failure"
+              }
+            ]
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "close-cart",
+        "name": "Close Converted Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1760,
+          180
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $json.id }}"
+              },
+              {
+                "name": "status",
+                "value": "not.in.(recovered,converted_before_first_touch,opted_out)"
+              },
+              {
+                "name": "opted_out",
+                "value": "is.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ status: $json.close_status, next_touch_at: null, recovered_order_id: $json.order ? $json.order.id : null, recovered_amount: $json.order ? $json.order.amount : null, recovered_currency: $json.order ? $json.order.currency : null }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Cancels every remaining touch by nulling next_touch_at.\n\nFilter mirrors workflow 04's attribution PATCH exactly, so the two writers cannot fight: whichever sees the conversion second matches 0 rows and logs rows_updated: 0 instead of firing a second close. The opted_out guard matters on its own - a cart that opts out mid-sweep and converts is `converted_after_opt_out` (a sale, not a recovery), and overwriting status here would destroy that distinction."
+      },
+      {
+        "id": "slack-conv",
+        "name": "Notify Slack Conversion",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1980,
+          180
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var cfg = $('Set Sweep Config').first().json; var o = c.order || {}; var name = [c.customer_first_name, c.customer_last_name].filter(Boolean).join(' ') || '(no name)'; var amt = (o.amount !== null && o.amount !== undefined) ? o.amount : c.cart_total; var cur = o.currency || c.currency || ''; var ref = o.name || 'order'; var text = (c.close_status === 'recovered') ? ('\\ud83d\\udcb0 Recovered ' + amt + ' ' + cur + ' \\u2014 ' + name + ', after touch ' + c.touches_sent + ' (' + ref + ')') : ('\\u2705 ' + name + ' checked out before any message was sent \\u2014 ' + amt + ' ' + cur + ' (' + ref + '). No recovery claimed.'); return { channel: cfg.slack_channel, text: text }; })()) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-conv",
+        "name": "Log Conversion Close",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2200,
+          180
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var patch = $('Close Converted Cart').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; var slack = $('Notify Slack Conversion').first().json; var sb = (slack && slack.body) ? slack.body : slack; var slackOk = !!(sb && sb.ok); var o = c.order || {}; return { workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: c.id, status: (rows === 1 && slackOk) ? 'success' : 'partial', step_name: 'cart_closed_converted', metadata: { checkout_token: c.checkout_token, close_status: c.close_status, touches_sent: c.touches_sent, order_id: o.id || null, order_ref: o.name || null, amount: (o.amount !== undefined ? o.amount : null), currency: o.currency || null, rows_updated: rows, slack_ok: slackOk } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-skip-conv",
+        "name": "Log Conversion Check Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1760,
+          860
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: $json.id, status: 'failed', step_name: 'conversion_check_failed', error_message: ('Shopify conversion check failed, cart skipped this sweep: ' + $json.conversion_detail).slice(0, 1000), metadata: { checkout_token: $json.checkout_token, touches_sent: $json.touches_sent, next_touch_at: $json.next_touch_at, action: 'skipped_no_send' } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "next_touch_at untouched - the cart is retried in 15 minutes"
+      },
+      {
+        "id": "get-window",
+        "name": "Get Send Window Config",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1760,
+          440
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/send_windows",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "country_code",
+                "value": "=eq.{{ $json.country_code }}"
+              },
+              {
+                "name": "select",
+                "value": "*"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "send-ctx",
+        "name": "Resolve Send Context",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1980,
+          440
+        ],
+        "parameters": {
+          "jsCode": "const cart = $('Classify Conversion Result').first().json;\nconst cfg  = $('Set Sweep Config').first().json;\n\nlet sw = null;\ntry {\n  const resp = $input.first().json;\n  const arr = (resp && resp.body) ? resp.body : (Array.isArray(resp) ? resp : null);\n  if (Array.isArray(arr) && arr[0]) sw = arr[0];\n} catch (e) {}\n\n// No send_windows row for this country (e.g. a US customer of a Gulf store).\n// Case 1 defaulted to Asia/Dubai because every lead was MENA. Here that would\n// apply Gulf quiet hours and a Fri-Sat weekend to a New York shopper, so we\n// fall back to the CART's own timezone with neutral defaults instead.\n// THREE cases, and the log has to tell them apart (M5.8):\n//   send_windows_row       - a configured market, use its rules\n//   cart_timezone_fallback - no row, but intake DID resolve the customer's tz\n//   store_timezone_default - we do NOT know the customer's timezone. Intake's\n//                            dial table covers the target markets plus GB/FR/US;\n//                            anything else (a German shopper, say) leaves it\n//                            null. We then message during the STORE's hours and\n//                            SAY SO, rather than logging a customer timezone we\n//                            never had. Surfaced by the M5.8 Haiku-fallback test.\nconst tzSource    = (sw && sw.timezone) ? 'send_windows_row'\n                  : (cart.timezone ? 'cart_timezone_fallback' : 'store_timezone_default');\nconst tz          = (sw && sw.timezone) || cart.timezone || 'Asia/Dubai';\nconst weekendDays = (sw && Array.isArray(sw.weekend_days)) ? sw.weekend_days : (sw ? [5, 6] : [6, 0]);\nconst quietStart  = (sw && sw.quiet_hours_start) || '22:00:00';\nconst quietEnd    = (sw && sw.quiet_hours_end)   || '08:00:00';\n\nconst PRAYER = {\n  AE:{city:'Dubai',country:'United Arab Emirates',method:16},\n  SA:{city:'Riyadh',country:'Saudi Arabia',method:4},\n  QA:{city:'Doha',country:'Qatar',method:10},\n  KW:{city:'Kuwait City',country:'Kuwait',method:9},\n  BH:{city:'Manama',country:'Bahrain',method:8},\n  OM:{city:'Muscat',country:'Oman',method:4},\n  EG:{city:'Cairo',country:'Egypt',method:5},\n  JO:{city:'Amman',country:'Jordan',method:23},\n  LB:{city:'Beirut',country:'Lebanon',method:2},\n  MA:{city:'Casablanca',country:'Morocco',method:21}\n};\nconst prayer = PRAYER[cart.country_code] || null;\nconst respectPrayer = (sw ? (sw.respect_prayer_times !== false) : false) && !!prayer;\n\nconst now = DateTime.now().setZone(tz);\n\nfunction hm(t){ const p = (t || '00:00').toString().split(':'); return { h: parseInt(p[0]||'0',10), m: parseInt(p[1]||'0',10) }; }\nconst qs = hm(quietStart), qe = hm(quietEnd);\nconst sMin = qs.h*60 + qs.m, eMin = qe.h*60 + qe.m, nMin = now.hour*60 + now.minute;\nlet inQuiet;\nif (sMin > eMin) inQuiet = (nMin >= sMin || nMin < eMin);   // window crosses midnight\nelse inQuiet = (nMin >= sMin && nMin < eMin);\n\nconst dow = now.weekday % 7;                                 // Luxon Mon=1..Sun=7 -> JS Sun=0..Sat=6\nconst isWeekend = weekendDays.includes(dow);\n\nfunction nextOpen(d){\n  let cand = d.set({ hour: qe.h, minute: qe.m, second: 0, millisecond: 0 });\n  if (d > cand) cand = cand.plus({ days: 1 });\n  let guard = 0;\n  while (weekendDays.includes(cand.weekday % 7) && guard < 9){\n    cand = cand.plus({ days: 1 }).set({ hour: qe.h, minute: qe.m, second: 0, millisecond: 0 });\n    guard++;\n  }\n  return cand;\n}\n\nconst resume = (!isWeekend && !inQuiet) ? now : nextOpen(now);\nconst windowDelayed = resume.toMillis() > now.toMillis() + 1000;\n\nreturn [{ json: {\n  timezone: tz,\n  country_code: cart.country_code,\n  send_window_source: tzSource,\n  weekend_days: weekendDays,\n  is_weekend: isWeekend,\n  in_quiet_hours: inQuiet,\n  window_delayed: windowDelayed,\n  window_resume: resume.toISO(),\n  respect_prayer_times: respectPrayer,\n  prayer_city: prayer ? prayer.city : null,\n  prayer_country: prayer ? prayer.country : null,\n  prayer_method: prayer ? prayer.method : null,\n  // Skip the aladhan call when the window already blocks us, when the country\n  // opts out, or in test mode - one fewer external call per cart per sweep.\n  needs_prayer_check: (!windowDelayed) && respectPrayer && !cfg.test_mode,\n  test_mode: cfg.test_mode,\n  now_local: now.toISO()\n} }];"
+        },
+        "notes": "Case 1 logic, but non-MENA carts fall back to their own timezone"
+      },
+      {
+        "id": "if-prayer",
+        "name": "Needs Prayer Check",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          2200,
+          440
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-prayer",
+                "leftValue": "={{ $json.needs_prayer_check }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "get-prayer",
+        "name": "Get Prayer Times",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2420,
+          340
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "=https://api.aladhan.com/v1/timingsByCity/{{ $now.setZone($json.timezone).toFormat('dd-LL-yyyy') }}",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "city",
+                "value": "={{ $json.prayer_city }}"
+              },
+              {
+                "name": "country",
+                "value": "={{ $json.prayer_country }}"
+              },
+              {
+                "name": "method",
+                "value": "={{ $json.prayer_method }}"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "prayer-delay",
+        "name": "Resolve Prayer Delay",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2640,
+          340
+        ],
+        "parameters": {
+          "jsCode": "const ctx = $('Resolve Send Context').first().json;\nconst now = DateTime.now().setZone(ctx.timezone);\n\nlet prayerCheck = 'ok';\nlet delayed = false;\nlet resume = now;\n\nlet timings = null;\ntry {\n  const data = $input.first().json;\n  const d = (data && data.body) ? data.body : data;\n  if (d && d.data && d.data.timings) timings = d.data.timings;\n} catch (e) {}\n\nif (!timings) {\n  // aladhan unreachable. Do NOT block the send - a missing prayer calendar is\n  // not a reason to withhold a transactional message, and the quiet-hours\n  // window has already been enforced. Logged so it is visible in the digest.\n  prayerCheck = 'unavailable';\n} else {\n  const names = ['Fajr','Dhuhr','Asr','Maghrib','Isha'];\n  for (const n of names) {\n    const t = timings[n];\n    if (!t) continue;\n    const parts = t.toString().slice(0,5).split(':');\n    const pt = now.set({ hour: parseInt(parts[0],10), minute: parseInt(parts[1],10), second: 0, millisecond: 0 });\n    if (Math.abs(now.diff(pt, 'minutes').minutes) <= 15) { delayed = true; break; }\n  }\n  if (delayed) { resume = now.plus({ minutes: 30 }); prayerCheck = 'delayed'; }\n}\n\nreturn [{ json: {\n  prayer_check: prayerCheck,\n  prayer_delayed: delayed,\n  prayer_resume: delayed ? resume.toISO() : null\n} }];"
+        }
+      },
+      {
+        "id": "gate",
+        "name": "Apply Send Gate",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2860,
+          440
+        ],
+        "parameters": {
+          "jsCode": "const cart = $('Classify Conversion Result').first().json;\nconst ctx  = $('Resolve Send Context').first().json;\nconst cfg  = $('Set Sweep Config').first().json;\n\n// Resolve Prayer Delay only runs on one of the two branches.\nlet prayer = { prayer_check: 'skipped', prayer_delayed: false, prayer_resume: null };\ntry {\n  const p = $('Resolve Prayer Delay').first();\n  if (p && p.json) prayer = p.json;\n} catch (e) {}\n\n// TOUCH-1 AGE GUARD (M5.2b; decisions.md 2026-08-03 M3.6). A Shopify recovery\n// link 302s to the store root until Shopify creates its AbandonedCheckout\n// record (~10-11 min on this store), so touch 1 must never go to a cart younger\n// than MIN_AGE_MINUTES - the message would arrive with a dead call-to-action.\n// NOT bypassable by TEST_MODE: every other gate reason is a timing preference,\n// this one is a correctness precondition. Compressing it does not speed a test\n// up, it invalidates it. To test touch 1 now, backdate the cart's created_at.\nconst MIN_AGE_MINUTES = 15;\nconst touchNumber = (cart.touches_sent || 0) + 1;\nlet too_young = false;\nlet too_young_resume = null;\nlet cart_age_minutes = null;\nif (touchNumber === 1 && cart.created_at) {\n  const createdMs = Date.parse(cart.created_at);\n  if (!isNaN(createdMs)) {\n    cart_age_minutes = Math.round((Date.now() - createdMs) / 60000);\n    if (cart_age_minutes < MIN_AGE_MINUTES) {\n      too_young = true;\n      too_young_resume = new Date(createdMs + 45 * 60000).toISOString();\n    }\n  }\n}\n\nconst blocked = !!(ctx.window_delayed || prayer.prayer_delayed || too_young);\n\n// Latest of the applicable resume times.\nlet resumeAt = null;\nconst cands = [];\nif (ctx.window_delayed && ctx.window_resume) cands.push(ctx.window_resume);\nif (prayer.prayer_delayed && prayer.prayer_resume) cands.push(prayer.prayer_resume);\nif (too_young && too_young_resume) cands.push(too_young_resume);\nfor (const c of cands) {\n  if (resumeAt === null || Date.parse(c) > Date.parse(resumeAt)) resumeAt = c;\n}\n\nconst reasons = [];\nif (ctx.in_quiet_hours) reasons.push('quiet_hours');\nif (ctx.is_weekend) reasons.push('weekend');\nif (prayer.prayer_delayed) reasons.push('prayer_time');\nif (too_young) reasons.push('cart_too_young');\n\n// The gate is always COMPUTED honestly; test mode only changes the ACTION, so a\n// bypassed send still logs exactly what it would have done in production.\nreturn [{ json: {\n  gate_blocked: (blocked && !cfg.test_mode) || too_young,\n  gate_would_block: blocked,\n  gate_bypassed_by_test_mode: blocked && cfg.test_mode && !too_young,\n  cart_too_young: too_young,\n  cart_age_minutes: cart_age_minutes,\n  gate_reason: reasons.join('+') || 'open',\n  resume_at: resumeAt,\n  timezone: ctx.timezone,\n  now_local: ctx.now_local,\n  send_window_source: ctx.send_window_source,\n  in_quiet_hours: ctx.in_quiet_hours,\n  is_weekend: ctx.is_weekend,\n  prayer_check: prayer.prayer_check,\n  // pending_verification means \"we have not yet proven this cart was abandoned\".\n  // The Shopify check just proved it, so promote it even if we cannot send yet.\n  next_status: cart.status === 'pending_verification' ? 'abandoned' : cart.status\n} }];"
+        }
+      },
+      {
+        "id": "if-gate",
+        "name": "Route Send Gate",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          3080,
+          440
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-gate",
+                "leftValue": "={{ $json.gate_blocked }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "push-window",
+        "name": "Push Next Touch To Window",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3300,
+          640
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $('Classify Conversion Result').first().json.id }}"
+              },
+              {
+                "name": "status",
+                "value": "in.(pending_verification,abandoned,recovering)"
+              },
+              {
+                "name": "opted_out",
+                "value": "is.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ next_touch_at: $json.resume_at, status: $json.next_status }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Deferral: push next_touch_at to the window/prayer/too-young resume time.\nSame status + opted_out guard as the post-send commit: a cart that converted or opted out while this sweep was computing the gate must not be re-armed with a new next_touch_at. return=representation, so a lost race matches 0 rows and is logged as rows_updated: 0."
+      },
+      {
+        "id": "log-defer",
+        "name": "Log Send Window Deferral",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3520,
+          640
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var g = $('Apply Send Gate').first().json; var patch = $('Push Next Touch To Window').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; return { workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: c.id, status: rows === 1 ? 'success' : 'partial', step_name: 'touch_deferred_send_window', metadata: { checkout_token: c.checkout_token, touch_number: (c.touches_sent || 0) + 1, reason: g.gate_reason, timezone: g.timezone, now_local: g.now_local, resume_at: g.resume_at, send_window_source: g.send_window_source, prayer_check: g.prayer_check, rows_updated: rows } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "build-msg",
+        "name": "Build Touch Message Request",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          3300,
+          380
+        ],
+        "parameters": {
+          "jsCode": "const cart = $('Classify Conversion Result').first().json;\nconst cfg  = $('Set Sweep Config').first().json;\nconst touch = (cart.touches_sent || 0) + 1;\n\n// Money formatting is deterministic (Hussein, 2026-08-04): Western digits,\n// thousands separators, currency code AFTER the number, no pointless decimals.\n// Done here rather than asked of the model - \"42663000 LBP\" is unreadable and a\n// model asked to format numbers will drift between messages.\nfunction fmtMoney(amount, currency) {\n  const cur = String(currency || '').toUpperCase();\n  if (amount === null || amount === undefined || amount === '') return cur;\n  const n = Number(amount);\n  if (!isFinite(n)) return String(amount) + (cur ? ' ' + cur : '');\n  // Currencies with no minor unit in practice - LBP totals run to 8 digits.\n  const ZERO_DECIMAL = ['LBP','IQD','JPY','KRW','VND','CLP','ISK','KWD_NO'];\n  const zero = ZERO_DECIMAL.indexOf(cur) >= 0;\n  const hasCents = Math.abs(n - Math.round(n)) > 0.004;\n  const dp = (zero || !hasCents) ? 0 : 2;\n  const s = n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });\n  return cur ? (s + ' ' + cur) : s;\n}\nconst total_display = fmtMoney(cart.cart_total, cart.currency);\n\n// Register varies by market (Hussein, 2026-08-04). حضرتك is natural in Egypt and\n// the Levant but reads slightly off in the Gulf, where formality is warmer and\n// less honorific-heavy. The VARIABLE is formal-vs-informal; the expressions that\n// carry it are market-specific, so the model is told which market it is writing\n// for rather than being handed one honorific to use everywhere.\nconst LEVANT_EGYPT = ['LB','JO','SY','PS','EG'];\nconst GULF = ['AE','SA','QA','KW','BH','OM'];\nconst cc = String(cart.country_code || '').toUpperCase();\nconst register_zone = LEVANT_EGYPT.indexOf(cc) >= 0 ? 'levant_egypt'\n                    : (GULF.indexOf(cc) >= 0 ? 'gulf' : 'other');\n\nconst REGISTER_NOTE = {\n  levant_egypt: [\n    'Market: Levant / Egypt. Address the customer as حضرتك - it is natural here.',\n    'حضرتك IS REQUIRED: it must appear AT LEAST ONCE in the message body, on every',\n    'touch including the short farewell of touch 3. A message without it is rejected',\n    'and the customer receives a generic template instead. It just must not sit in',\n    'the greeting beside the name - put it in the sentence about the cart or the order.',\n    'حضرتك is a polite SECOND person: verbs after it stay 2nd person.',\n    '  WRONG: حضرتك اختار العباية   (3rd masc)',\n    '  WRONG: حضرتك اختارت العباية  (3rd fem)',\n    '  RIGHT: حضرتك اخترت العباية   (2nd person)',\n    'Do NOT weld an object pronoun onto that verb at all - name the items instead.',\n    'Ruled by Hussein 2026-09-08, after both touches that day shipped the ya form:',\n    '  WRONG: حضرتك تركتيهما في السلة   (ya carrier - dialect)',\n    '  WRONG: حضرتك تركتِهما في السلة   (pronoun welded on)',\n    '  RIGHT: حضرتك تركتِ حقيبة يد وعباية في السلة   (female)',\n    '  RIGHT: حضرتك تركت حقيبة يد وعباية في السلة   (male)',\n    'Do NOT use 2nd-person-feminine PRESENT forms either (تستخدمي / تستخدمين).',\n    'Consequence for touch 2: do NOT command the customer to use the discount code.',\n    'State that the code exists and is theirs to use. Reaching for the imperative is',\n    'what breaks this rule every time.'\n  ].join('\\n'),\n  gulf: [\n    'Market: Gulf. Do NOT use حضرتك - it reads as Egyptian/Levantine here.',\n    'Use warm, plain, formal Modern Standard Arabic. Khaleeji formality is warmer',\n    'and less honorific-heavy: natural greetings such as حياك الله fit where they',\n    'suit the sentence. Respectful but not stiff, and never أنت / أنتِ informality.'\n  ].join('\\n'),\n  other: [\n    'Market: outside Levant/Egypt/Gulf. Use plain, warm, formal Modern Standard',\n    'Arabic. Do not use أنت / أنتِ or informal imperatives.'\n  ].join('\\n')\n};\n\nconst items = Array.isArray(cart.cart_items) ? cart.cart_items : [];\nconst named = items.slice(0, 2).map(function (i) {\n  return (i.title || 'item') + ' ×' + (i.quantity || 1);\n});\nconst extra = items.length - named.length;\nconst itemsSummary = named.join('; ') + (extra > 0 ? ('; and ' + extra + ' more') : '');\n\nconst lang = ['ar','en','fr','mixed'].indexOf(cart.language) >= 0 ? cart.language : 'en';\nconst firstName = (cart.customer_first_name || '').toString().trim();\n\n// ---------------------------------------------------------------------------\n// A LATIN NAME INSIDE AN ARABIC MESSAGE - fixed 2026-09-08 on Hussein's report.\n// Shopify stores whatever the shopper typed at checkout, which for this store is\n// `Hussein` in Latin script. The MODEL transliterates it on its own, so a\n// generated message read `مرحباً حسين` while the STATIC FALLBACK read\n// `مرحباً Hussein` - the same customer greeted two different ways depending on\n// whether the checker had degraded the message. Only the fallback was wrong.\n//\n// The Arabic spellings below are NOT invented here. Every one is lifted from the\n// name lists already in workflow 01's `Detect Language And Timezone`, which\n// shipped with the gender inference. An UNKNOWN name keeps its Latin script,\n// which is exactly what arabic-master-reference.md section 5 requires: \"if a\n// Latin-script name can't be cleanly rendered, keep it in Latin script inside\n// the Arabic sentence rather than mangling it\". This is a lookup, never a\n// transliteration engine.\n//\n// Applied only when the message language is Arabic, and only when the stored\n// name is Latin - a name already in Arabic script is passed through untouched.\n// [VET] the pairings are standard spellings but have not had Hussein's pass.\n// ---------------------------------------------------------------------------\nconst AR_NAMES = {\n    'mohammed':  'محمد',\n    'mohamed':   'محمد',\n    'muhammad':  'محمد',\n    'mohammad':  'محمد',\n    'ahmed':     'احمد',\n    'ahmad':     'احمد',\n    'ali':       'علي',\n    'omar':      'عمر',\n    'umar':      'عمر',\n    'khaled':    'خالد',\n    'khalid':    'خالد',\n    'hassan':    'حسن',\n    'hasan':     'حسن',\n    'hussein':   'حسين',\n    'hussain':   'حسين',\n    'youssef':   'يوسف',\n    'yousef':    'يوسف',\n    'yusuf':     'يوسف',\n    'ibrahim':   'ابراهيم',\n    'abdullah':  'عبدالله',\n    'abdallah':  'عبدالله',\n    'mariam':    'مريم',\n    'maryam':    'مريم',\n    'layla':     'ليلى',\n    'laila':     'ليلى',\n    'leila':     'ليلى',\n    'zeinab':    'زينب',\n    'zainab':    'زينب',\n    'rana':      'رنا',\n    'reem':      'ريم',\n    'rim':       'ريم',\n    'hind':      'هند',\n    'nada':      'ندى',\n    'sahar':     'سحر',\n    'dina':      'دينا'\n};\nconst isLatin = /^[A-Za-z][A-Za-z'\\- ]*$/.test(firstName);\nconst arName = AR_NAMES[firstName.toLowerCase()];\nconst arTarget = (lang === 'ar' || lang === 'mixed');\nconst displayName = (arTarget && isLatin && arName) ? arName : firstName;\n\n\n// Gender agreement (arabic-master-reference.md section 5; ruled for Case 2 2026-08-07).\n// Inferred once at INTAKE and sticky in the database, so the register cannot\n// change between touch 1 and touch 3. NULL on carts predating the migration,\n// which reads as 'unknown' - and 'unknown' is a real answer, not a failure:\n// it asks for gender-neutral phrasing rather than a guess.\nconst gender = ['female','male'].indexOf(String(cart.customer_gender || '').toLowerCase()) >= 0\n  ? String(cart.customer_gender).toLowerCase() : 'unknown';\n\nconst GENDER_NOTE = {\n  female: [\n    'Customer gender: FEMALE. Use feminine agreement.',\n    'Use the FULL MSA feminine present forms, which KEEP the ن:',\n    '  RIGHT: تستخدمين، تطلبين، ترغبين',\n    '  WRONG: تستخدمي، تطلبي، ترغبي   (colloquial - the ن is dropped)',\n    'Past tense: NEVER a ي. The 2nd-person feminine past is written bare with a',\n    'final KASRA on the last letter, and takes no attached object pronoun.',\n    '  RIGHT: حضرتك تركتِ / حضرتك اخترتِ',\n    '  WRONG: حضرتك تركتي / حضرتك تركتيهما / حضرتك تركتِهما',\n    'The kasra is the ONLY diacritic you may write. Every other short vowel is banned.',\n    'Keep the final ت - it is part of the verb, not an ending to trim:',\n    '  WRONG: حضرتك تركِ / حضرتك ترك   (3rd person)',\n    '  RIGHT: حضرتك تركتِ'\n  ].join('\\n'),\n  male: [\n    'Customer gender: MALE. Use masculine agreement throughout (اخترت، طلبك).',\n    'Past tense is bare and carries NO diacritic: حضرتك تركت.',\n    '\"Bare\" means no ي and no vowel mark. It does NOT mean a shorter verb - the final ت is',\n    'part of the 2nd-person form and dropping it makes it 3rd person:',\n    '  WRONG: حضرتك ترك / حضرتك اختار   (3rd person)',\n    '  RIGHT: حضرتك تركت / حضرتك اخترت',\n    'Do not use any feminine forms, and never write a kasra.'\n  ].join('\\n'),\n  unknown: [\n    'Customer gender: UNKNOWN. Do NOT guess.',\n    'Prefer phrasing that avoids gendered verbs and pronouns altogether:',\n    '  السلة محفوظة · يمكن إتمام الطلب في أي وقت · الطلب بانتظاركم',\n    'If a gendered form is genuinely unavoidable, use the masculine as the MSA default.'\n  ].join('\\n')\n};\n\n// prompts/touch-message-generator.md v8 - keep the two in sync.\nconst system = [\n\"You write ONE WhatsApp message from a MENA online store to a customer who added items to their\",\n\"cart and left without completing checkout. You are a helpful shop assistant, not a marketer.\",\n\"\",\n\"Write in the customer's language (given as language = ar | en | fr | mixed):\",\n\"- \\\"ar\\\"    Natural Modern Standard Arabic, adjusted to the customer's country.\",\n\"- \\\"en\\\"    Natural, warm professional English.\",\n\"- \\\"fr\\\"    Natural professional French.\",\n\"- \\\"mixed\\\" Lead in Arabic; a light English touch is acceptable.\",\n\"\",\n\"Touch number decides the intent - this is the only thing that changes between touches:\",\n\"- touch 1 (about an hour after they left): a helpful reminder, ZERO pressure. Their cart is\",\n\"  saved. No discount, no urgency, no persuasion.\",\n\"- touch 2 (next day): offer the discount code you are given, framed as a gift from the store,\",\n\"  never as desperation and never as a countdown. State the code exactly as given.\",\n\"- touch 3 (two days later): the GENTLEST of the three, not the hardest. It is a warm goodbye:\",\n\"  say plainly that this is the last message about this cart, and that it stays saved if they\",\n\"  change their mind. The escalation in this sequence is the OFFER in touch 2, never the tone.\",\n\"  No fake scarcity, no invented stock levels, no invented deadlines, no guilt, no pressure.\",\n\"\",\n\"The message MUST:\",\n\"1. Greet the customer by first name if one is given; otherwise a warm neutral greeting.\",\n\"   In Arabic, greet with the NAME ALONE: مرحباً حسين. Do NOT stack the honorific and the name\",\n\"   in the greeting - مرحباً حضرتك حسين is WRONG. If you want the honorific in the greeting\",\n\"   itself, the only correct form is the prepositional مرحباً بحضرتك. Otherwise حضرتك\",\n\"   belongs later in the sentence, not beside the name.\",\n\"2. Name the actual product(s) they left - at most 2 by name, then \\\"and N more\\\" if there are\",\n\"   more. Use the titles exactly as given, including Arabic titles.\",\n\"3. State the cart total WITH its currency code. Never state an amount without its currency,\",\n\"   and never convert between currencies.\",\n\"4. On touch 2 only: state the discount code exactly as provided.\",\n\"\",\n\"Cultural rules (non-negotiable):\",\n\"- Formality: always respectful. The customer is a stranger to the store. NEVER use أنت / أنتِ and\",\n\"  never use informal imperatives (خذي وقتك، أردتِ), however friendly the brand. Grammatical gender\",\n\"  is GIVEN to you in the user message - use it, and do not infer it from the name yourself. The\",\n\"  RESPECTFUL EXPRESSIONS THEMSELVES VARY BY MARKET - use the market guidance given in the user\",\n\"  message, not one honorific everywhere.\",\n\"\",\n\"  These are wrong in EVERY market - informality to a stranger:\",\n\"    WRONG: خذي وقتك، السلة بانتظارك   (informal feminine imperative)\",\n\"    WRONG: سلتك محفوظة متى أردتِ   (أنتِ address - no honorific)\",\n\"    The fault there is the MISSING حضرتك, not the kasra. حضرتك أردتِ is correct\",\n\"    for a female customer - the honorific keeps the address polite (ruled 2026-09-08).\",\n\"- NEVER use إن شاء الله or \\\"God willing\\\" for delivery, timing or logistics. Say what is true,\",\n\"  or سنبذل قصارى جهدنا.\",\n\"- Do not ASSUME the customer's faith, and never make the message religious in substance.\",\n\"  مرحباً / Hello / Bonjour is always safe and is the default.\",\n\"  NARROWED 2026-09-01 (Hussein): a conventional COURTESY formula that is simply polite register\",\n\"  in its market is allowed - حياك الله in the Gulf is a greeting, not a religious claim, and the\",\n\"  Gulf guidance below offers it deliberately. What stays banned is presuming faith (do not open\",\n\"  with السلام عليكم) and invoking God for OUTCOMES - see the إن شاء الله rule above, which is\",\n\"  absolute and unchanged.\",\n\"\",\n\"Arabic canonical wording - the store's FIXED vocabulary (arabic-master-reference.md section 8).\",\n\"When you express one of these ideas, reproduce the phrase EXACTLY as written here.\",\n\"Do not paraphrase it, do not inflect it for gender, and do NOT weld a letter onto the\",\n\"front of it. Writing لأتم عملية الشراء turns the store's CTA into a first-person\",\n\"statement; the phrase must stand alone exactly as written (ruled 2026-09-08).\",\n\"These are fixed strings that\",\n\"must read identically in every message the store ever sends:\",\n\"    your cart              سلتك\",\n\"    we saved your cart     حفظنا لك سلتك\",\n\"    your order is waiting  طلبك بانتظارك\",\n\"    complete your order    أكمل طلبك\",\n\"    complete the purchase  أتم عملية الشراء\",\n\"    discount code          كود خصم\",\n\"    free shipping          شحن مجاني\",\n\"    we will do our best    سنبذل قصارى جهدنا\",\n\"    thank you              شكراً لك\",\n\"\",\n\"Counting products (Arabic number agreement):\",\n\"    1 item      منتج واحد\",\n\"    2 items     منتجان\",\n\"    3-10 items  3 منتجات   (Western digit + plural)\",\n\"    11+ items   15 منتجاً   (Western digit + singular, per MSA)\",\n\"\",\n\"Arabic vocabulary - MODERN STANDARD ARABIC ONLY:\",\n\"- Dialect words are forbidden, however natural they sound in speech. These are all WRONG:\",\n\"    حبيت، بدك، بدي، عايز، شو، ليش، هلق، كتير، منيح، يلا، بكرا، لسا، هيك\",\n\"- For \\\"whenever you like\\\" write متى شئت or متى رغبت. NEVER متى حبيت.\",\n\"\",\n\"Arabic spelling:\",\n\"- Write Arabic WITHOUT vowel marks: no fatha, damma, kasra, shadda or sukun.\",\n\"  Write اخترت, never اخترتِ. Commercial Arabic is written unvowelled.\",\n\"- The tanween on مرحباً / شكراً is normal and expected - keep it.\",\n\"\",\n\"Style:\",\n\"- HARD LIMIT: 320 characters. Shorter is better. This is WhatsApp, not email.\",\n\"- Do NOT write any URL, link, \\\"click here\\\", or opt-out/STOP instruction. The system appends\",\n\"  the real link and the opt-out line itself. Writing your own will break the message.\",\n\"- At most one tasteful emoji, and only if it fits. Default to none.\",\n\"- Output ONLY the message text. No quotes, no JSON, no code fences, no preamble, no signature.\"\n].join('\\n');\n\nconst user = [\n'Store: ' + cfg.store_name,\n'Customer:',\n'- first_name: ' + (displayName || '(none)'),\n'- language: ' + lang,\n'- country: ' + (cart.country_code || '(unknown)'),\n'- gender: ' + gender,\n'Cart:',\n'- items: ' + (itemsSummary || '(unspecified items)'),\n'- item_count: ' + items.length,\n'- total: ' + total_display + '   <- write the total EXACTLY like this, do not reformat it',\n'Touch:',\n'- touch_number: ' + touch,\n'- discount_code: ' + (touch === 2 ? cfg.discount_code : ''),\n'',\n'',\nREGISTER_NOTE[register_zone],\n'',\nGENDER_NOTE[gender],\n'',\n'Write the message body now.'\n].join('\\n');\n\n// ---------------------------------------------------------------------------\n// SESSION OR TEMPLATE? (2026-09-03)\n//\n// WhatsApp lets a business reply free-form for 24 hours after the customer's\n// last inbound message. Outside that window a production deployment must send a\n// Meta-approved TEMPLATE, and pays per message for it.\n//\n// RECORDED, NOT ACTED ON. This is deliberate: the Twilio sandbox has no\n// templates at all, so every message this build sends is already free-form. A\n// second send branch here would be a limb no test could ever exercise\n// differently, which is worse than no branch. What the classification buys is a\n// real cost model in the daily digest instead of an estimate, and the field a\n// client deployment needs on the day it does have templates.\n//\n// It is a LOWER BOUND on the true window, and that is the safe direction. The\n// service window belongs to the conversation with the BUSINESS NUMBER, and this\n// build shares one Twilio sandbox number across three case studies - a reply the\n// router hands to Case 1 opens the real window without stamping any Case 2 cart.\n// So this can call a session send a template, never the reverse, and the error\n// costs an over-estimate of template spend rather than a compliance breach.\nconst SESSION_WINDOW_HOURS = 24;\nlet hours_since_inbound = null;\nif (cart.last_inbound_at) {\n  const inboundMs = Date.parse(cart.last_inbound_at);\n  if (!isNaN(inboundMs)) {\n    hours_since_inbound = Math.round(((Date.now() - inboundMs) / 3600000) * 10) / 10;\n  }\n}\nconst message_class = (hours_since_inbound !== null && hours_since_inbound < SESSION_WINDOW_HOURS)\n  ? 'session' : 'template';\n\nreturn [{ json: {\n  anthropic_body: {\n    model: 'claude-sonnet-5',\n    // Sonnet 5 runs ADAPTIVE THINKING when `thinking` is omitted (Sonnet 4.6 ran\n    // thinking-off), and max_tokens caps thinking + text TOGETHER. On 2026-08-04\n    // that combination silently broke this node: the model spent all 400 output\n    // tokens on a thinking block, emitted no text block at all, and every touch\n    // fell back to the static template. Writing a 320-character WhatsApp message\n    // does not need reasoning, so thinking is disabled explicitly rather than\n    // left to the default.\n    thinking: { type: 'disabled' },\n    output_config: { effort: 'low' },\n    // Headroom over the 320-char body budget. Sonnet 5's tokenizer produces ~30%\n    // more tokens than Sonnet 4.6 for the same text, and Arabic is denser still.\n    max_tokens: 1000,\n    system: system,\n    messages: [{ role: 'user', content: user }]\n  },\n  touch_number: touch,\n  message_class: message_class,\n  hours_since_inbound: hours_since_inbound,\n  language: lang,\n  total_display: total_display,\n  register_zone: register_zone,\n  customer_gender: gender,\n  raw_total_digits: (cart.cart_total === null || cart.cart_total === undefined) ? null : String(Math.round(Number(cart.cart_total))),\n  items_summary: itemsSummary,\n  item_count: items.length,\n  first_name: displayName,\n  first_name_source: (displayName === firstName) ? 'as_stored' : 'arabic_lookup',\n  discount_code: touch === 2 ? cfg.discount_code : null\n} }];"
+        },
+        "notes": "System prompt mirrors prompts/touch-message-generator.md v8"
+      },
+      {
+        "id": "gen-msg",
+        "name": "Generate Touch Message (Sonnet)",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3520,
+          380
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.anthropic.com/v1/messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "anthropicApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "anthropic-version",
+                "value": "2023-06-01"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($json.anthropic_body) }}",
+          "options": {
+            "timeout": 20000
+          }
+        },
+        "credentials": {
+          "anthropicApi": {
+            "id": "azRjMcNgGfj9c985",
+            "name": "Anthropic account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Sonnet 5: Arabic tone/formality is worth the price here"
+      },
+      {
+        "id": "parse-msg",
+        "name": "Parse Touch Message",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          3740,
+          380
+        ],
+        "parameters": {
+          "jsCode": "const cart = $('Classify Conversion Result').first().json;\nconst req  = $('Build Touch Message Request').first().json;\nconst cfg  = $('Set Sweep Config').first().json;\n\nconst touch = req.touch_number;\nconst lang  = req.language;\nconst tlang = (lang === 'mixed') ? 'ar' : lang;\nconst name  = req.first_name;\nconst money = req.total_display;   // already formatted: '42,663,000 LBP'\nconst first = (Array.isArray(cart.cart_items) && cart.cart_items[0] && cart.cart_items[0].title)\n  ? cart.cart_items[0].title : null;\n\nlet body = '';\nlet degraded = true;\nlet degradeReason = 'no_response';\ntry {\n  const data = $input.first().json;\n  const d = (data && data.body) ? data.body : data;\n  if (d && Array.isArray(d.content)) {\n    const tb = d.content.find(function (b) { return b && b.type === 'text' && b.text; });\n    if (tb) {\n      body = tb.text.toString().trim();\n      if (body) { degraded = false; degradeReason = null; }\n    } else {\n      // A 200 with content but NO text block. Seen on 2026-08-04: Sonnet 5 spent\n      // the entire max_tokens budget on a thinking block and produced no text.\n      // 'no_response' hid that - it reads as an API failure when the API was\n      // fine. Name the block types and the stop reason so the next occurrence is\n      // diagnosable from the run log instead of the execution data.\n      const kinds = d.content.map(function (b) { return (b && b.type) || 'unknown'; }).join(',');\n      degradeReason = ('no_text_block: stop=' + (d.stop_reason || '?') +\n                       ' blocks=[' + (kinds || 'empty') + ']').slice(0, 200);\n    }\n  } else if (d && d.error) {\n    degradeReason = ('api_error: ' + JSON.stringify(d.error)).slice(0, 200);\n  }\n} catch (e) { degradeReason = 'parse_error'; }\n\n// A model that ignored the instruction and wrote its own link would produce a\n// message with two links, one of them possibly wrong. Fall back instead.\nif (!degraded && /https?:\\/\\//i.test(body)) { degraded = true; degradeReason = 'model_wrote_a_url'; }\n\n// The total is formatted in code and handed to the model ready to use. If the\n// raw digit run appears instead (42663000 rather than 42,663,000) the model\n// reformatted it, which is exactly the unreadable output this rule exists to\n// prevent. Applies in every language.\nif (!degraded && req.raw_total_digits && req.raw_total_digits.length > 3 &&\n    body.indexOf(req.raw_total_digits) !== -1) {\n  degraded = true; degradeReason = 'unformatted_amount';\n}\n\n// Arabic formality is enforced in code, not left to the prompt. Prompt v1 and v2\n// both produced inconsistent register on the same customer profile - v2 reliably\n// produced حضرتك but still wrote informal-feminine verbs beside it\n// (سلتك محفوظة لحضرتك متى أردتِ), which is internally inconsistent in formal Arabic.\n// Same reasoning as appending the recovery link and the STOP line ourselves:\n// anything that must be right every time does not belong to the model.\n//\n// Deliberately HIGH-PRECISION rather than exhaustive. Over-matching would send\n// every Arabic customer a static template and quietly delete the personalisation\n// that is the point of the feature, so this flags only unambiguous markers.\n// Arabic letter range \\u0621-\\u064A is used for word boundaries because JS \\b is ASCII-only.\nif (!degraded && (tlang === 'ar')) {\n  const AR = '\\u0621-\\u064A';\n  // 2nd-person feminine PAST stems, shared by the kasra carve-out below and by\n  // rule 10. One list, because a stem the checker tolerates a kasra on is exactly\n  // a stem it must reject a \\u064a on. Known limitation, deliberately accepted: for some\n  // stems this shape is also a 1st-person possessive noun - \\u0631\\u063a\\u0628\\u062a\\u064a can mean \"my\n  // desire\". A false positive costs the personalisation and still sends the\n  // respectful template, so it is the cheap direction to be wrong in. \\u062d\\u0641\\u0638 is kept\n  // out for the same reason it always was: \\u062d\\u0641\\u0638\\u062a\\u0647\\u0627 is the STORE speaking.\n  const FEM_PAST_STEMS = ['\\u0631\\u063a\\u0628\\u062a','\\u062a\\u0631\\u0643\\u062a','\\u0627\\u062e\\u062a\\u0631\\u062a','\\u0623\\u0636\\u0641\\u062a',\n    '\\u0623\\u0631\\u062f\\u062a','\\u0632\\u0631\\u062a','\\u0627\\u0634\\u062a\\u0631\\u064a\\u062a','\\u0637\\u0644\\u0628\\u062a','\\u0648\\u0636\\u0639\\u062a',\n    '\\u0623\\u0643\\u0645\\u0644\\u062a','\\u0646\\u0633\\u064a\\u062a','\\u0628\\u062f\\u0623\\u062a'];\n\n  const MARKERS = [\n    { re: new RegExp('(^|[^' + AR + '])\\u0623\\u0646\\u062A[\\u0650\\u064E]?([^' + AR + ']|$)'), tag: 'informal_pronoun' },\n    // RULE 2 RETIRED 2026-08-07. It matched ت + kasra, but rule 9 below rejects\n    // EVERY vowel mark, so this could never fire on its own. Kept out rather than\n    // left in as dead code that implies a check nobody is performing.\n    { re: new RegExp('(^|[^' + AR + '])[\\u0648\\u0641]?(\\u062E\\u0630\\u064A|\\u062E\\u0630|\\u062A\\u0641\\u0636\\u0644\\u064A|\\u062A\\u0641\\u0636\\u0644|\\u0627\\u0633\\u062A\\u062E\\u062F\\u0645\\u064A|\\u0627\\u0633\\u062A\\u062E\\u062F\\u0645|\\u0627\\u0637\\u0644\\u0628\\u064A|\\u0627\\u0637\\u0644\\u0628|\\u0623\\u0643\\u0645\\u0644\\u064A|\\u0623\\u0643\\u0645\\u0644|\\u062C\\u0631\\u0628\\u064A|\\u062C\\u0631\\u0628)([^' + AR + ']|$)'), tag: 'informal_imperative' },\n    // 2nd-person-FEMININE PRESENT - the أنتِ address in present tense.\n    // Ruled wrong by Hussein 2026-08-04, after \"يسعدنا حضرتك تستخدمي كود الخصم\"\n    // was generated, passed every check, and was DELIVERED to a real handset.\n    // The imperative list could not catch it: استخدمي cannot match inside\n    // تستخدمي because the boundary guard requires a non-Arabic character before\n    // the marker, and ت precedes it. Same verb stems as the imperative list,\n    // both the MSA form (تستخدمين) and the colloquial short form (تستخدمي).\n    // Colloquial dropped-ن feminine present (تستخدمي). WRONG IN EVERY CASE,\n    // including for a female customer: arabic-master-reference.md section 2 says that when a\n    // form is dialectal, the standard MSA form is the one to use. This is the\n    // exact shape that was generated, passed every check and was DELIVERED on\n    // 2026-08-04 before rule 7 existed.\n    { re: new RegExp('(^|[^' + AR + '])[\\u0648\\u0641]?(\\u062a\\u0633\\u062a\\u062e\\u062f\\u0645\\u064a|\\u062a\\u0637\\u0644\\u0628\\u064a|\\u062a\\u062c\\u0631\\u0628\\u064a|\\u062a\\u0643\\u0645\\u0644\\u064a|\\u062a\\u0623\\u062e\\u0630\\u064a|\\u062a\\u062a\\u0641\\u0636\\u0644\\u064a)([^' + AR + ']|$)'), tag: 'colloquial_feminine_present' },\n    // RULE 8 WAS HERE AND IS DELETED - ruled by Hussein 2026-09-08.\n    // It required the ي carrier before an attached object pronoun\n    // (تركتيهما, not تركتهما), ruled 2026-08-04 and narrowed to female-only\n    // 2026-08-31. Both touches delivered on 2026-09-08 carried that spelling and\n    // Hussein ruled it wrong: the ي form is DIALECT. The MSA 2nd-person feminine\n    // past is bare with a final kasra (تركتِ), the masculine is bare (تركت), and\n    // neither takes a ي - with or without a pronoun. Rule 10 below now owns every\n    // case, so a marker that DEMANDED the wrong spelling could not be narrowed, only\n    // removed. Kept as a comment because two live workflows shipped under it.\n    // NO VOWEL MARKS. Ruled by Hussein 2026-08-04: commercial Arabic is written\n    // unvowelled, so the unvowelled spellings in the style guide are the only\n    // accepted ones. This also removes a genuine contradiction - rule 2 flags\n    // ت + kasra, which is exactly the vowelled spelling of اخترت,\n    // the form 1.1 rules CORRECT. Banning the marks removes the ambiguity at\n    // source instead of arbitrating it per verb.\n    //\n    // TANWEEN (064B-064D) is deliberately ALLOWED: مرحباً and\n    // شكراً carry it by convention, they appear in the approved fallback\n    // templates, and banning it would degrade essentially every Arabic message\n    // because they all open with a greeting.\n    { re: /[َ-ْٰ]/, tag: 'vowel_marks_present' }\n  ];\n  // Full MSA feminine present (تستخدمين, keeping the ن). Correct FOR A FEMALE\n  // CUSTOMER (arabic-master-reference.md section 5, ruled for Case 2 2026-08-07); still an\n  // error for a male customer, and still an error when we do not know - because\n  // 'unknown' means the model was asked for gender-neutral phrasing and ignored it.\n  if (req.customer_gender !== 'female') {\n    MARKERS.push({\n      re: new RegExp('(^|[^' + AR + '])[\\u0648\\u0641]?(\\u062a\\u0633\\u062a\\u062e\\u062f\\u0645\\u064a\\u0646|\\u062a\\u0637\\u0644\\u0628\\u064a\\u0646|\\u062a\\u062c\\u0631\\u0628\\u064a\\u0646|\\u062a\\u0643\\u0645\\u0644\\u064a\\u0646|\\u062a\\u0623\\u062e\\u0630\\u064a\\u0646|\\u062a\\u062a\\u0641\\u0636\\u0644\\u064a\\u0646|\\u062a\\u0631\\u063a\\u0628\\u064a\\u0646)([^' + AR + ']|$)'),\n      tag: 'feminine_present_wrong_gender'\n    });\n  }\n\n  // Approved CTAs are masked out before the markers run, NOT removed from the\n  // marker list. arabic-master-reference.md section 8.2 marks أكمل طلبك and أتم عملية الشراء\n  // canonical, and Hussein whitelisted them 2026-08-07 - but أكمل on its own is\n  // still an informal imperative everywhere else in the message. Masking keeps\n  // both true. They are fixed strings: never inflected, not even for gender.\n  const APPROVED_CTA = [\n    '\\u0623\\u0643\\u0645\\u0644 \\u0637\\u0644\\u0628\\u0643',\n    '\\u0623\\u062a\\u0645 \\u0639\\u0645\\u0644\\u064a\\u0629 \\u0627\\u0644\\u0634\\u0631\\u0627\\u0621'\n  ];\n  let scanned = body;\n  for (const cta of APPROVED_CTA) scanned = scanned.split(cta).join(' ');\n\n  // KASRA CARVE-OUT - ruled by Hussein 2026-09-08, and deliberately the narrowest\n  // shape that satisfies the ruling. The MSA 2nd-person feminine past is written\n  // \\u062a\\u0631\\u0643\\u062a\\u0650 with a final kasra; the no-vowel-marks marker bans every short\n  // vowel, and was added on 2026-08-04 precisely because a vowelled \\u0627\\u062e\\u062a\\u0631\\u062a\\u0650\n  // was indistinguishable from the form section 1.1 called correct. Both rulings\n  // stand: the kasra is stripped from `scanned` - so the vowel-mark marker never\n  // sees it - ONLY at the END of a known feminine-past stem AND ONLY when the\n  // cart's gender is female. A kasra anywhere else, or on a male or unknown cart,\n  // still degrades. Same masking technique as APPROVED_CTA above, and for the same\n  // reason: it keeps two true rules true without arbitrating between them.\n  if (req.customer_gender === 'female') {\n    const femKasra = new RegExp('(^|[^' + AR + '])([\\\\u0648\\\\u0641]?(?:' + FEM_PAST_STEMS.join('|') + '))\\\\u0650(?![' + AR + '])', 'g');\n    scanned = scanned.replace(femKasra, '$1$2');\n  }\n\n  const hits = [];\n  for (const m of MARKERS) {\n    // RULE 8 IS FEMALE-ONLY. Ruled by Hussein 2026-08-31 after the first live\n    // male-customer generation. For a male addressee the same spelling IS the\n    // correct 2nd-person masculine form, and unvowelled it is identical to the\n    // feminine-missing-ya form this rule was written to catch - so applying it\n    // to every cart degraded every Arabic message to a male customer down to\n    // the static template. Observed live 2026-08-28 on cart f75d8d6a\n    // (customer_gender male, degrade_reason feminine_suffix_missing_ya) - the\n    // first Arabic touch this system ever generated for a man.\n    //\n    // Deliberate consequence of 'female only' rather than 'not male': a cart\n    // whose gender is `unknown` is NOT checked by this rule. `unknown` already\n    // means the model was asked for gender-neutral phrasing, and rule 7b still\n    // rejects feminine present forms there.\n    if (m.female_only && req.customer_gender !== 'female') continue;\n    if (m.re.test(scanned)) hits.push(m.tag);\n  }\n\n\n  // RULE 14 - A CANONICAL CTA CARRYING A PROCLITIC.\n  // Ruled by Hussein 2026-09-08, on the corrected touch sent the same day: the model\n  // wrote \\u0644 + \\u0623\\u062a\\u0645 ..., which reads as a first-person \"so that I complete\n  // the purchase\" rather than the canonical phrase. The failure is structural, not\n  // stylistic: APPROVED_CTA is MASKED OUT above before any marker runs, so a letter\n  // welded onto the front of a CTA destroyed the evidence of itself and passed every\n  // rule. The masking is right - \\u0623\\u0643\\u0645\\u0644 alone is still an informal imperative\n  // everywhere else - so the prefix has to be caught BEFORE the mask, against `body`.\n  //\n  // Only prefixes that change PERSON or MOOD are rejected: \\u0644 (li-, subjunctive),\n  // \\u0633 (sa-, future) and \\u0628 (bi-). \\u0648 and \\u0641 are deliberately allowed - they are\n  // plain conjunctions that leave the verb untouched, and rejecting them would degrade\n  // ordinary sentences for nothing. Widen the list if a real message proves otherwise.\n  const CTA_PROCLITICS = ['\\u0644', '\\u0633', '\\u0628'];\n  for (const cta of APPROVED_CTA) {\n    const ctaRe = new RegExp('(^|[^' + AR + '])[' + CTA_PROCLITICS.join('') + ']' + cta);\n    if (ctaRe.test(body)) { hits.push('cta_prefixed'); break; }\n  }\n\n  // RULE 11 - إن شاء الله for logistics or timing.\n  // Banned by global CLAUDE.md, by arabic-master-reference.md §7 (Religious phrasing) and by\n  // style guide §3 - three documents - and until 2026-08-07 it was enforced by\n  // NONE of them: the line had silently dropped out of the deployed system\n  // prompt while touch-message-generator.md still claimed it was there, and no\n  // marker ever existed. Found by reading the running prompt against the file.\n  // Matches the common spellings, with or without the alef-hamza and the space.\n  const RELIGIOUS = /(^|[^ء-ي])[وف]?إ?ا?ن\\s?شاء\\s?الله/;\n  if (RELIGIOUS.test(scanned)) hits.push('religious_phrase');\n\n  // RULE 10 - a bare 2nd-fem past verb must NOT carry the ي.\n  // حضرتك اخترت / لو رغبت  ->  right.   حضرتك اخترتي / لو رغبتي  ->  wrong.\n  // Requires the ي to be at a word boundary, so the pronoun-suffixed form ruled\n  // CORRECT in 1.1a (حضرتك تركتيهما) does not match here and rule 8 does not\n  // match it either. The two rules are complements, not overlaps.\n  //\n  // Known limitation, deliberately accepted (same treatment as حفظ in rule 8):\n  // for some stems this shape is also a first-person possessive noun - رغبتي can\n  // mean \"my desire\". A false positive costs the personalisation and still sends\n  // the respectful template, so it is the cheap direction to be wrong in.\n  const OBJ_PRONOUN = '(?:\\\\u0647\\\\u0645\\\\u0627|\\\\u0647\\\\u0645|\\\\u0647\\\\u0646|\\\\u0647\\\\u0627|\\\\u0647)?';\n  const bareYa = new RegExp('(^|[^' + AR + '])[\\\\u0648\\\\u0641]?(' + FEM_PAST_STEMS.join('|') + ')\\\\u064a' + OBJ_PRONOUN + '(?![' + AR + '])');\n  if (bareYa.test(scanned)) hits.push('bare_feminine_ya');\n\n  // RULE 12 - COLLOQUIAL / DIALECT VOCABULARY.\n  // Ruled by Hussein 2026-09-01, on the first model-generated Arabic message this\n  // system ever delivered: `طلبك بانتظارك متى حبيت تكمل الطلب`. حبيت is Levantine\n  // for \"you liked/wanted\"; MSA wants متى شئت or متى رغبت. The message passed all\n  // eleven existing rules because NONE of them look at vocabulary - they check\n  // pronouns, imperatives, agreement, vowel marks and religious phrasing. A\n  // dialect word is exactly as wrong as an informal pronoun and was unguarded.\n  //\n  // High-precision list, same policy as every other marker here: only tokens that\n  // cannot be defended as MSA in any position. Words that are merely COMMON in\n  // speech but valid in MSA are deliberately absent.\n  const DIALECT = ['حبيت','بدك','بدي','بدها',\n    'عايز','عاوز','شو','ليش','هلق',\n    'هلأ','كتير','منيح','يلا','بكرا',\n    'لسا','هيك','منشان'];\n  const dialect = new RegExp('(^|[^' + AR + '])(' + DIALECT.join('|') + ')(?![' + AR + '])');\n  if (dialect.test(scanned)) hits.push('colloquial_dialect_word');\n\n  // RULE 13 - GREETING STACKED WITH حضرتك.\n  // Ruled by Hussein 2026-09-01, same message: `مرحباً حضرتك حسين`. The honorific\n  // and the name must not be stacked in the greeting. Correct is the bare name\n  // (مرحباً حسين) or the prepositional form (مرحباً بحضرتك); حضرتك belongs later in\n  // the sentence, where rule `missing_respectful_form` still requires it.\n  //\n  // Anchored on the GREETING, not on the name: the model transliterates, so the\n  // cart's `Hussein` arrived as حسين and matching req.first_name would have missed\n  // it entirely. مرحباً بحضرتك does not match - the بـ is attached, so the\n  // whitespace-then-حضرتك sequence never occurs.\n  const GREET_HADRETAK = /(مرحبا|أهلا|اهلا)ً?\\s+حضرتك/;\n  if (GREET_HADRETAK.test(scanned)) hits.push('greeting_stacked_with_hadretak');\n\n  // Agreement after حضرتك. Corrected 2026-08-03 by Hussein (native speaker):\n  // حضرتك is a POLITE SECOND PERSON in real MENA usage, so the verb stays in the\n  // 2nd person - حضرتك اخترت, NOT حضرتك اختارت and NOT حضرتك اختار.\n  //\n  // My first attempt encoded it as a 3rd-person noun phrase and only looked\n  // right because تركت is spelled identically for 2nd person and 3rd feminine in\n  // unvowelled text. Hollow verbs expose the difference: اختار -> اخترت (2nd)\n  // vs اختارت (3rd fem). See prompts/arabic-style-guide.md.\n  //\n  // Arabic morphology cannot be parsed properly with a regex, so this is\n  // deliberately narrow: حضرتك immediately followed by a 3rd-person form that is\n  // DISTINGUISHABLE in script. Verbs whose 2nd-person and 3rd-feminine forms are\n  // identical (تركت, طلبت, وضعت...) are intentionally not flagged - they are not\n  // errors, they are ambiguous.\n  // 3rd-person MASCULINE (he left / he chose ...)\n  const THIRD_MASC = ['\\u062A\\u0631\\u0643', '\\u0627\\u062E\\u062A\\u0627\\u0631',\n    '\\u0623\\u0636\\u0627\\u0641', '\\u0646\\u0633\\u064A', '\\u0637\\u0644\\u0628',\n    '\\u0648\\u0636\\u0639', '\\u0628\\u062F\\u0623', '\\u0623\\u0643\\u0645\\u0644',\n    '\\u0634\\u0627\\u0647\\u062F', '\\u0632\\u0627\\u0631', '\\u062D\\u0641\\u0638',\n    '\\u0623\\u0631\\u0627\\u062F', '\\u0627\\u0634\\u062A\\u0631\\u0649'];\n  // 3rd-person FEMININE, but only the forms that differ in script from the\n  // correct 2nd-person form: اختارت vs اخترت, أضافت vs أضفت, أرادت vs أردت,\n  // اشترت vs اشتريت, زارت vs زرت.\n  const THIRD_FEM = ['\\u0627\\u062E\\u062A\\u0627\\u0631\\u062A', '\\u0623\\u0636\\u0627\\u0641\\u062A',\n    '\\u0623\\u0631\\u0627\\u062F\\u062A', '\\u0627\\u0634\\u062A\\u0631\\u062A', '\\u0632\\u0627\\u0631\\u062A'];\n  const WRONG_AGREEMENT = THIRD_FEM.concat(THIRD_MASC);   // longest first matters\n  const agree = new RegExp('\\u062D\\u0636\\u0631\\u062A\\u0643\\\\s+(' + WRONG_AGREEMENT.join('|') + ')(?![' + AR + '])');\n  if (agree.test(scanned)) hits.push('verb_agreement_after_hadretak');\n  // حضرتك is required only in the markets where it is natural (Hussein,\n  // 2026-08-04). Requiring it in the Gulf would force an Egyptian/Levantine\n  // honorific on a Khaleeji customer - the opposite of correct. Informality is\n  // still blocked everywhere by the markers above.\n  if (req.register_zone === 'levant_egypt' &&\n      body.indexOf('\\u062D\\u0636\\u0631\\u062A\\u0643') === -1) hits.push('missing_respectful_form');\n  if (hits.length) { degraded = true; degradeReason = 'informal_arabic:' + hits.join('+'); }\n}\n\n// Static fallbacks: a slightly generic reminder beats silence, and the link is\n// the part that actually recovers the cart.\nconst item = first ? first : (tlang === 'ar' ? 'طلبك' : (tlang === 'fr' ? 'votre article' : 'your item'));\nconst FALLBACK = {\n  ar: {\n    1: (name ? ('مرحباً ' + name + '، ') : 'مرحباً، ') + 'السلة الخاصة بحضرتك (' + item + ') لا تزال محفوظة لدينا بقيمة ' + money + '. يمكن إتمام الطلب في أي وقت يناسب حضرتك.',\n    2: (name ? ('مرحباً ' + name + '، ') : 'مرحباً، ') + 'السلة الخاصة بحضرتك (' + item + '، ' + money + ') لا تزال محفوظة. هدية منا: كود الخصم ' + cfg.discount_code + '.',\n    3: (name ? ('مرحباً ' + name + '، ') : 'مرحباً، ') + 'هذه آخر رسالة بخصوص السلة الخاصة بحضرتك (' + item + '، ' + money + '). ستبقى محفوظة إن رغبت حضرتك في إتمام الطلب.'\n  },\n  fr: {\n    1: (name ? ('Bonjour ' + name + ', ') : 'Bonjour, ') + 'votre panier (' + item + ') est bien enregistré, ' + money + '. Vous pouvez finaliser quand vous voulez.',\n    2: (name ? ('Bonjour ' + name + ', ') : 'Bonjour, ') + 'votre panier (' + item + ', ' + money + ') vous attend. Un cadeau de notre part : le code ' + cfg.discount_code + '.',\n    3: (name ? ('Bonjour ' + name + ', ') : 'Bonjour, ') + 'dernier message au sujet de votre panier (' + item + ', ' + money + '). Il reste enregistré si vous souhaitez finaliser.'\n  },\n  en: {\n    1: (name ? ('Hi ' + name + ', ') : 'Hello, ') + 'your cart (' + item + ', ' + money + ') is still saved. You can finish checking out whenever suits you.',\n    2: (name ? ('Hi ' + name + ', ') : 'Hello, ') + 'your cart (' + item + ', ' + money + ') is still waiting. A gift from us: use code ' + cfg.discount_code + '.',\n    3: (name ? ('Hi ' + name + ', ') : 'Hello, ') + 'last message about your cart (' + item + ', ' + money + '). It stays saved if you would like to complete it.'\n  }\n};\n\nif (degraded) body = (FALLBACK[tlang] || FALLBACK.en)[touch] || (FALLBACK.en[1]);\n\n// Body budget so body + link + opt-out line stays under the 500-char cap (spec 6).\nfunction clip(s, n) {\n  if (s.length <= n) return s;\n  const cut = s.slice(0, n);\n  const sp = cut.lastIndexOf(' ');\n  return (sp > n * 0.6 ? cut.slice(0, sp) : cut).trim() + '…';\n}\nbody = clip(body, 320);\n\nconst STOP = {\n  // Canonical opt-out instruction, arabic-master-reference.md §8.5 (vetted [OK] 2026-08-07).\n  // Replaces the earlier ad-hoc 'للإيقاف أرسل: توقف'. The quotes around the\n  // keyword are why `Resolve Reply Context` in workflow 03 now strips quote\n  // characters before matching - otherwise a customer who copies the keyword\n  // back verbatim would not be recognised as opting out.\n  ar: 'لإيقاف الرسائل، أرسل \"توقف\"',\n  en: 'Reply STOP to unsubscribe.',\n  fr: 'Répondez STOP pour vous désabonner.'\n};\n\n// ---------------------------------------------------------------------------\n// THE RECOVERY LINK OPENS IN THE CUSTOMER'S OWN LANGUAGE (2026-09-03).\n//\n// Shopify's abandoned_checkout_url carries the locale of the storefront the\n// shopper happened to browse. On a single-language store that is en-LB for\n// EVERY customer, so a carefully-written Arabic message ended in a link that\n// opened an English checkout - the one moment in the whole sequence where the\n// customer is asked to act.\n//\n// TWO GUARDS, both there to protect the link rather than the language:\n//\n// 1. REWRITE ONLY, NEVER CONSTRUCT. A URL with no locale parameter is returned\n//    byte-identical. Shopify also expresses locale as a PATH PREFIX in some\n//    configurations, and synthesising one of those would produce a 404 on the\n//    single most load-bearing element of the message.\n//\n// 2. ONLY A LOCALE THE STORE PUBLISHES. Shopify serves a locale only when it is\n//    a published storefront language; asking for an unpublished one degrades\n//    the link instead of translating it. PUBLISHED_LOCALES is therefore an\n//    explicit allow-list of what THIS store publishes, not a list of languages\n//    the system supports. Adding a language to the store means adding it here\n//    too - and until then the customer gets a working link in the wrong\n//    language, which beats a broken one in the right language.\n//\n// The region subtag is preserved (en-LB -> ar-LB), because it drives currency\n// and shipping presentment and has nothing to do with the language.\n// ---------------------------------------------------------------------------\nconst PUBLISHED_LOCALES = ['en', 'ar'];\n\nfunction localizeRecoveryUrl(u, wantLang) {\n  if (!u) return { url: '', locale: null, changed: false };\n  const m = u.match(/([?&]locale=)([A-Za-z]{2})(-[A-Za-z0-9]+)?/);\n  if (!m) return { url: u, locale: null, changed: false };\n  const had = m[2] + (m[3] || '');\n  if (PUBLISHED_LOCALES.indexOf(wantLang) < 0) return { url: u, locale: had, changed: false };\n  if (m[2].toLowerCase() === wantLang) return { url: u, locale: had, changed: false };\n  const want = wantLang + (m[3] || '');\n  return { url: u.replace(m[0], m[1] + want), locale: want, changed: true };\n}\n\nconst loc = localizeRecoveryUrl(cart.recovery_url || '', tlang);\nconst url = loc.url;\nlet message = body;\nif (url) message += '\\n' + url;\n// Opt-out instruction on touch 1 only (spec 7). Appended deterministically -\n// compliance controls are not left to a language model.\nif (touch === 1) message += '\\n' + (STOP[tlang] || STOP.en);\n\n// Absolute guard.\nif (message.length > 500) {\n  const overflow = message.length - 500;\n  body = clip(body, Math.max(40, 320 - overflow - 1));\n  message = body + (url ? ('\\n' + url) : '') + (touch === 1 ? ('\\n' + (STOP[tlang] || STOP.en)) : '');\n}\n\nreturn [{ json: {\n  message: message,\n  message_chars: message.length,\n  message_degraded: degraded,\n  degrade_reason: degradeReason,\n  touch_number: touch,\n  language: lang,\n  total_display: req.total_display,\n  register_zone: req.register_zone,\n  raw_total_digits: (cart.cart_total === null || cart.cart_total === undefined) ? null : String(Math.round(Number(cart.cart_total))),\n  message_class: req.message_class,\n  hours_since_inbound: req.hours_since_inbound,\n  recovery_url_locale: loc.locale,\n  recovery_url_localized: loc.changed,\n  has_recovery_url: !!url\n} }];"
+        },
+        "notes": "Appends the real recovery link + opt-out line - never the model"
+      },
+      {
+        "id": "send-wa",
+        "name": "Send WhatsApp Touch (Twilio)",
+        "type": "n8n-nodes-base.twilio",
+        "typeVersion": 1,
+        "position": [
+          3960,
+          380
+        ],
+        "parameters": {
+          "resource": "sms",
+          "operation": "send",
+          "from": "+14155238886",
+          "to": "={{ $('Classify Conversion Result').first().json.phone }}",
+          "toWhatsapp": true,
+          "message": "={{ $('Parse Touch Message').first().json.message }}"
+        },
+        "credentials": {
+          "twilioApi": {
+            "id": "i6W4hkBVTg5L0D9v",
+            "name": "Twilio account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "if-accept",
+        "name": "Did Twilio Accept",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          4180,
+          380
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-sid",
+                "leftValue": "={{ $json.sid }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "string",
+                  "operation": "notEmpty",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "wait-status",
+        "name": "Wait Before Delivery Check",
+        "type": "n8n-nodes-base.wait",
+        "typeVersion": 1.1,
+        "position": [
+          4400,
+          300
+        ],
+        "parameters": {
+          "resume": "timeInterval",
+          "amount": 10,
+          "unit": "seconds"
+        },
+        "notes": "Twilio needs a moment to actually attempt delivery",
+        "webhookId": "b08e7f0e-a3d8-4916-8fcc-0bf233e39ce2"
+      },
+      {
+        "id": "check-delivery",
+        "name": "Check Delivery Status",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          4620,
+          300
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "=https://api.twilio.com/2010-04-01/Accounts/{{ $json.account_sid }}/Messages/{{ $json.sid }}.json",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "twilioApi",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "twilioApi": {
+            "id": "i6W4hkBVTg5L0D9v",
+            "name": "Twilio account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Re-reads the message: a SID is acceptance, not delivery"
+      },
+      {
+        "id": "eval-delivery",
+        "name": "Evaluate Delivery",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          4840,
+          300
+        ],
+        "parameters": {
+          "jsCode": "const sent = $('Send WhatsApp Touch (Twilio)').first().json;\nconst resp = $input.first().json;\n\n// Twilio issues a SID the moment it ACCEPTS a message; delivery is attempted\n// afterwards. On 2026-08-03 that difference cost three touches: every message\n// came back `queued` with `error_code: null`, and all three later failed with\n// 63015 (recipient not joined to the WhatsApp sandbox). Because the workflow\n// counted the touch at acceptance, three customers who received nothing each\n// had one of their three permitted touches spent. The touch is therefore now\n// committed only after re-reading the message resource.\nlet status = null, errCode = null, detail = null, polled = false;\ntry {\n  // Do NOT use this workflow's usual `resp.body ? resp.body : resp` unwrap here.\n  // That idiom strips n8n's fullResponse envelope, but a Twilio Message resource\n  // has its OWN `body` field holding the message TEXT - so the unwrap silently\n  // replaced the object with a string and every poll came back 'unknown'.\n  // `Check Delivery Status` does not set fullResponse, so this IS the resource.\n  const d = resp;\n  if (d && d.sid) {\n    status = d.status || null;\n    errCode = (d.error_code !== undefined) ? d.error_code : null;\n    polled = true;\n  } else if (d && d.error) {\n    detail = ('status_poll_failed: ' + JSON.stringify(d.error)).slice(0, 200);\n  } else {\n    detail = ('status_poll_unrecognised: ' + JSON.stringify(d === null || d === undefined ? {} : d)).slice(0, 200);\n  }\n} catch (e) { detail = 'status_poll_exception'; }\n\nconst HARD_FAIL = ['failed', 'undelivered'];\nconst failed = polled && HARD_FAIL.indexOf(String(status)) >= 0;\n\n// ---------------------------------------------------------------------------\n// THREE OUTCOMES, NOT TWO (2026-09-03).\n//\n// Until now every delivery failure took the same path: push next_touch_at +2h\n// and try again. For a number with no WhatsApp account at all that is an\n// infinite loop - the cart never closes, it sits in the open queue for the full\n// 30-day lookback, and it drags the recovery rate down as though the COPY had\n// failed. A failure now has to say which kind it is.\n//\n// TERMINAL - the recipient cannot receive from us at all. Close the cart.\n//   63003  Channel could not find To address (not a registered WhatsApp user)\n//   63024  Invalid message recipient - Meta reports an invalid WhatsApp user or\n//          a recipient-side restriction\n//   63015  Sandbox can only message numbers that have joined it. Sandbox-only,\n//          so it cannot occur on a production WABA, and on the demo rig it means\n//          exactly \"we cannot reach this handset\" - the same answer.\n//\n// SLOW RETRY - a real ceiling, not a dead number. Retrying in 2h only buys\n// another failure, so back off a full day instead.\n//   131049 Meta declined to deliver a MARKETING template to protect the user's\n//          engagement quality: the per-user frequency cap. Meta's own guidance\n//          is to wait at least 24h. Treating this as terminal would write off a\n//          perfectly good customer over a rate limit.\n//   63038  OUR account exceeded its own daily message allowance. Nothing to do\n//          with this customer.\n//\n// EVERYTHING ELSE keeps the +2h retry it has always had, including 63005 and\n// 63021: those look recipient-shaped but also fire on OUR malformed content,\n// and closing a customer's cart because we sent bad markup is the wrong\n// direction. Unknown codes retry too - locked decision #4 is silence over a\n// wrong message, and guessing wrong here costs a few extra retries rather than\n// a customer written off.\n// ---------------------------------------------------------------------------\nconst TERMINAL_CODES     = [63003, 63015, 63024];\nconst SLOW_RETRY_CODES   = [131049, 63038];\nconst SLOW_RETRY_MINUTES = 1440;\n\nconst code  = (errCode === null || errCode === undefined || errCode === '') ? null : Number(errCode);\nconst known = (code !== null && !isNaN(code));\n\nconst terminal  = failed && known && TERMINAL_CODES.indexOf(code) >= 0;\nconst slowRetry = !terminal && known && SLOW_RETRY_CODES.indexOf(code) >= 0;\n\n// If OUR OWN poll failed, that is not evidence the customer missed the message.\n// Unknown is not failed: the touch stands, and the run log carries\n// delivery_status 'unknown' so a systematically broken poll stays visible.\nreturn [{ json: {\n  send_ok: !failed,\n  delivery_terminal: terminal,\n  retry_after_minutes: slowRetry ? SLOW_RETRY_MINUTES : null,\n  delivery_status: polled ? status : 'unknown',\n  delivery_error_code: errCode,\n  delivery_detail: detail,\n  twilio_sid: sent ? (sent.sid || null) : null\n} }];"
+        },
+        "notes": "failed/undelivered => the touch is NOT counted.\n\nClassifies the failure into three, not two (2026-09-03): terminal (the number cannot receive WhatsApp - close the cart), slow retry (a Meta or Twilio ceiling - back off 24h), or the ordinary +2h retry. Unrecognised codes retry, per locked decision #4."
+      },
+      {
+        "id": "if-sent",
+        "name": "Did Send Succeed",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          5060,
+          380
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-ok",
+                "leftValue": "={{ $json.send_ok }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "postpone",
+        "name": "Postpone After Send Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5500,
+          760
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $('Classify Conversion Result').first().json.id }}"
+              },
+              {
+                "name": "status",
+                "value": "in.(pending_verification,abandoned,recovering)"
+              },
+              {
+                "name": "opted_out",
+                "value": "is.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var cfg = $('Set Sweep Config').first().json; var mins = cfg.send_failure_backoff_minutes; var dv = null; try { dv = $('Evaluate Delivery').first().json; } catch (e) {} if (dv && dv.retry_after_minutes && !cfg.test_mode) mins = dv.retry_after_minutes; return { next_touch_at: $now.plus({ minutes: mins }).toUTC().toISO(), status: $('Apply Send Gate').first().json.next_status }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "touches_sent NOT incremented - the customer received nothing.\n\nSame status + opted_out guard as the other cart writers (M5.2b, extended after chaos test 5.7). Without it this node RESURRECTS a cart that converted or opted out while the sweep was mid-send: it would re-arm next_touch_at +2h and overwrite the closed status back to abandoned/recovering. Found by reading the code after 5.7 - the first fix pass covered only two of this workflow's four cart writers.\n\nThe backoff is normally +2h, but Evaluate Delivery can ask for a longer one (2026-09-03). A per-user marketing frequency cap (131049) or our own daily account limit (63038) is a ceiling that will still be there in two hours, so those wait a full day instead of failing four more times first. TEST_MODE keeps the compressed backoff so the fast 3-touch regression still runs in minutes. The Evaluate Delivery read is wrapped in try/catch because this node is also reached from the Did Twilio Accept false branch, where no delivery poll ever ran."
+      },
+      {
+        "id": "log-send-fail",
+        "name": "Log Send Failure",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5720,
+          760
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var m = $('Parse Touch Message').first().json; var t = $('Send WhatsApp Touch (Twilio)').first().json; var dv = null; try { dv = $('Evaluate Delivery').first().json; } catch (e) {} var err = (dv && dv.delivery_status && dv.delivery_status !== 'unknown') ? ('twilio delivery ' + dv.delivery_status + (dv.delivery_error_code ? (' (error ' + dv.delivery_error_code + ')') : '')) : (t && t.error ? (typeof t.error === 'string' ? t.error : JSON.stringify(t.error)) : 'twilio returned no message sid'); var patch = $('Postpone After Send Failure').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; return { workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: c.id, status: 'failed', step_name: 'twilio_send_failed', error_message: err.slice(0, 1000), metadata: { checkout_token: c.checkout_token, touch_number: m.touch_number, phone_country: c.country_code, rows_updated: rows, twilio_sid: (t && t.sid) || null, delivery_status: dv ? dv.delivery_status : 'not_accepted', delivery_error_code: dv ? dv.delivery_error_code : null, touch_not_counted: true, retry_in_minutes: ((dv && dv.retry_after_minutes && !$('Set Sweep Config').first().json.test_mode) ? dv.retry_after_minutes : $('Set Sweep Config').first().json.send_failure_backoff_minutes) } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "update-cart",
+        "name": "Update Cart After Touch",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5280,
+          300
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $('Classify Conversion Result').first().json.id }}"
+              },
+              {
+                "name": "touches_sent",
+                "value": "=eq.{{ $('Classify Conversion Result').first().json.touches_sent }}"
+              },
+              {
+                "name": "status",
+                "value": "in.(pending_verification,abandoned,recovering)"
+              },
+              {
+                "name": "opted_out",
+                "value": "is.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var cfg = $('Set Sweep Config').first().json; var t = $('Parse Touch Message').first().json.touch_number; var gap = cfg.next_gap_minutes[String(t)]; return { touches_sent: t, status: t >= 3 ? 'exhausted' : 'recovering', next_touch_at: t >= 3 ? null : $now.plus({ minutes: gap }).toUTC().toISO() }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Post-send commit. FOUR filters, each doing a different job:\n- id: the cart\n- touches_sent: optimistic lock against two overlapping sweeps double-incrementing\n- status IN (open states): a cart closed mid-sweep by 04 (recovered) must NOT be resurrected to 'recovering' with a fresh next_touch_at\n- opted_out=false: a STOP that landed mid-sweep must not be overwritten\nreturn=representation, so a lost race matches 0 rows and the run log says rows_updated: 0 rather than claiming a send that did not commit."
+      },
+      {
+        "id": "log-msg",
+        "name": "Log Touch Message",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5500,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/cart_messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ cart_id: $('Classify Conversion Result').first().json.id, direction: 'outbound', touch_number: $('Parse Touch Message').first().json.touch_number, message: $('Parse Touch Message').first().json.message, twilio_message_id: ($('Send WhatsApp Touch (Twilio)').first().json.sid || null), message_class: ($('Parse Touch Message').first().json.message_class || null) }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-touch",
+        "name": "Log Touch Run",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5720,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var m = $('Parse Touch Message').first().json; var g = $('Apply Send Gate').first().json; var t = $('Send WhatsApp Touch (Twilio)').first().json; var dv = $('Evaluate Delivery').first().json; var patch = $('Update Cart After Touch').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var row = (Array.isArray(pb) && pb[0]) ? pb[0] : null; var clean = row && !m.message_degraded && dv.delivery_status !== 'unknown'; return { workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: c.id, status: clean ? 'success' : 'partial', step_name: 'touch_sent', error_message: row ? null : 'cart update matched 0 rows - touches_sent may have changed concurrently', metadata: { checkout_token: c.checkout_token, touch_number: m.touch_number, language: m.language, message_chars: m.message_chars, message_degraded: m.message_degraded, degrade_reason: m.degrade_reason, has_recovery_url: m.has_recovery_url, recovery_url_locale: m.recovery_url_locale, recovery_url_localized: m.recovery_url_localized, message_class: m.message_class, hours_since_inbound: m.hours_since_inbound, twilio_sid: (t && t.sid) || null, delivery_status: dv.delivery_status, delivery_error_code: dv.delivery_error_code, timezone: g.timezone, now_local: g.now_local, gate_reason: g.gate_reason, gate_bypassed_by_test_mode: g.gate_bypassed_by_test_mode, test_mode: $('Set Sweep Config').first().json.test_mode, new_status: row ? row.status : null, next_touch_at: row ? row.next_touch_at : null } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "note-sweep",
+        "name": "Note - 02 - Verifier & Touch Sender (the core)",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -260,
+          40
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 300,
+          "content": "## 02 - Verifier & Touch Sender (the core)\nRuns every 15 minutes. There are NO Wait nodes: every touch is a `next_touch_at` timestamp in\nthe `carts` table, and this sweep processes whatever is due (locked decision #1). That survives\nn8n restarts, makes the queue visible in SQL, and lets a conversion or an opt-out cancel a\npending touch by simply nulling the timestamp.\n\nOrder per cart: verify against Shopify -> send-window/prayer gate -> generate -> send -> update.\nThe conversion check runs on EVERY sweep, immediately before the send, so a customer who bought\nfive minutes ago never receives a recovery message."
+        }
+      },
+      {
+        "id": "note-failsafe",
+        "name": "Note - Fail-safe: silence over a wrong message",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1300,
+          700
+        ],
+        "parameters": {
+          "width": 640,
+          "height": 260,
+          "content": "## Fail-safe: silence over a wrong message\nThree outcomes, never two (locked decision #4):\n- converted -> close the cart, no message, Slack the owner\n- not_converted -> proven safe to send\n- skip_api_failure -> UNKNOWN state: send nothing, leave next_touch_at alone, retry next sweep\n\nShopify answers HTTP 200 with an `errors` array when a scope is wrong, so \"no orders found\" and\n\"I was not allowed to look\" are indistinguishable unless you check for `errors` explicitly.\nReading a permissions failure as \"not converted\" would message a customer who already paid."
+        }
+      },
+      {
+        "id": "note-gate",
+        "name": "Note - Send window + prayer gate (no Wait node)",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          2860,
+          40
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 320,
+          "content": "## Send window + prayer gate (no Wait node)\nCase 1's logic, one behavioural change: instead of a Wait node holding the execution open, a\nblocked cart has `next_touch_at` pushed forward to the window start and is picked up by a later\nsweep.\n\nFallbacks matter here. A country with no `send_windows` row (a US shopper on a Gulf store) uses\nthe CART's timezone, not Asia/Dubai - otherwise New York inherits Gulf quiet hours and a Fri-Sat\nweekend. If aladhan is unreachable the send proceeds: quiet hours already passed, and a missing\nprayer calendar is not a reason to withhold a transactional message.\n\nTEST_MODE (in `Set Sweep Config`) only changes the ACTION, never the calculation - the gate is\nalways computed and logged honestly, so a bypassed send still records what it would have done."
+        }
+      },
+      {
+        "id": "note-cap",
+        "name": "Note - 3-touch cap and the touch schedule",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          5280,
+          40
+        ],
+        "parameters": {
+          "width": 660,
+          "height": 240,
+          "content": "## 3-touch cap and the touch schedule\ntouches_sent 1 -> +24h, 2 -> +48h, 3 -> next_touch_at NULL + status `exhausted` (spec 5).\nThere is no code path that can produce a 4th touch, and `carts.touches_sent` also carries a\nCHECK (0..3) constraint so a future bug in this workflow still cannot message a customer again.\n\nThe PATCH filters on `touches_sent=eq.<value read at the start of this cart>`. If two sweeps\never overlapped, the second update matches 0 rows instead of double-counting, and the run log\nrecords `rows_updated: 0` rather than silently lying about the send.\n\nA touch is counted only after Twilio confirms it did not FAIL. Twilio returns a SID at\nacceptance, before delivery is attempted - on 2026-08-03 three messages came back `queued` and\nlater failed with 63015, each having already consumed one of the three permitted touches. The\nWait + re-read closes that. Cost: ~10s per cart, so a full 50-cart sweep takes ~8.5 min against\na 15-min cycle. Above roughly 80 due carts per sweep this must become a Twilio status-callback\nwebhook instead of a poll.\n\nM5 decision (Hussein, 2026-08-04): the poll STAYS for this build. A status callback needs a\nstable public URL, and this demo runs on a quick cloudflared tunnel that has died six times.\nA delivery-confirmation mechanism that depends on the least reliable component in the stack is\nworse than none. First thing to change on a real deployment with a real hostname."
+        }
+      },
+      {
+        "id": "sweep-fetch-logs",
+        "name": "Summarize Sweep",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1080,
+          20
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "status,step_name,error_message"
+              },
+              {
+                "name": "execution_id",
+                "value": "=eq.{{ $execution.id }}"
+              },
+              {
+                "name": "workflow_name",
+                "value": "eq.02 - Verifier & Touch Sender"
+              },
+              {
+                "name": "limit",
+                "value": "200"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "Reads back THIS execution's own run_logs rows. Querying by execution_id rather than accumulating loop output is deliberate: every terminal branch of the loop returns a different item shape (HTTP responses from six different nodes), so counting them in code would be fragile. The log rows are already the canonical record - this just reads them.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "sweep-summary",
+        "name": "Build Sweep Summary",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1300,
+          20
+        ],
+        "parameters": {
+          "jsCode": "const resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst rows = (httpCode === 200 && Array.isArray(resp.body)) ? resp.body : [];\nconst n = (step) => rows.filter(r => r.step_name === step).length;\n\nconst sent       = n('touch_sent');\nconst deferred   = n('touch_deferred_send_window');\nconst closed     = n('cart_closed_converted');\nconst skipped    = n('conversion_check_failed');\nconst sendFailed = n('twilio_send_failed');\nconst fetchFail  = n('fetch_due_carts_failed');\n// Carts closed because the number cannot receive WhatsApp (2026-09-03). Counted\n// here or carts_processed silently under-reports every sweep that meets one -\n// the cart WAS processed, it just ended somewhere new.\nconst undeliverable = n('cart_closed_undeliverable');\nconst rowsFailed  = rows.filter(r => r.status === 'failed').length;\nconst rowsPartial = rows.filter(r => r.status === 'partial').length;\n\n// Observability that cannot read itself is not observability. If the read-back\n// failed we do NOT report a clean sweep - we say so and alert.\nconst readable = httpCode === 200;\n\nconst summary = {\n  carts_processed: sent + deferred + closed + skipped + sendFailed + undeliverable,\n  touches_sent: sent,\n  deferred: deferred,\n  closed_converted: closed,\n  closed_undeliverable: undeliverable,\n  skipped_api_failure: skipped,\n  send_failures: sendFailed,\n  fetch_failed: fetchFail,\n  rows_failed: rowsFailed,\n  rows_partial: rowsPartial,\n  summary_source: readable ? 'run_logs' : ('unavailable_http_' + httpCode)\n};\n\n// undeliverable is deliberately NOT part of `degraded`. A dead number is a\n// normal outcome of running a recovery campaign, not a fault in this system,\n// and alerting on it would page the owner for something they cannot fix. It is\n// reported in the summary and counted in the daily digest instead.\nconst degraded = !readable || rowsFailed > 0 || skipped > 0 || sendFailed > 0 || fetchFail > 0;\n\nlet headline;\nif (!readable) {\n  headline = 'Sweep finished but its own run_logs could not be read (HTTP ' + httpCode + ') - state unknown';\n} else if (fetchFail > 0) {\n  headline = 'Sweep could not read the cart queue - no carts were processed';\n} else {\n  const bits = [];\n  if (skipped > 0)    bits.push(skipped + ' cart(s) skipped: Shopify conversion check failed');\n  if (sendFailed > 0) bits.push(sendFailed + ' send failure(s) - touch NOT counted, retrying');\n  if (rowsFailed > 0 && bits.length === 0) bits.push(rowsFailed + ' failed step(s)');\n  headline = bits.join(' | ');\n}\n\nconst fields = [\n  { type: 'mrkdwn', text: '*Carts processed:*\\n' + summary.carts_processed },\n  { type: 'mrkdwn', text: '*Touches sent:*\\n' + sent },\n  { type: 'mrkdwn', text: '*Skipped (Shopify unknown):*\\n' + skipped },\n  { type: 'mrkdwn', text: '*Send failures:*\\n' + sendFailed },\n  { type: 'mrkdwn', text: '*Deferred (window/prayer/age):*\\n' + deferred },\n  { type: 'mrkdwn', text: '*Closed as converted:*\\n' + closed },\n  { type: 'mrkdwn', text: '*Closed as undeliverable:*\\n' + undeliverable }\n];\n\nconst errs = rows.filter(r => r.status === 'failed' && r.error_message).slice(0, 3)\n  .map(r => '- ' + r.step_name + ': ' + String(r.error_message).slice(0, 160)).join('\\n');\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: 'Sweep degraded - 02 Verifier & Touch Sender', emoji: false } },\n  { type: 'section', text: { type: 'mrkdwn', text: headline || 'Degraded' } },\n  { type: 'section', fields: fields }\n];\nif (errs) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*Errors:*\\n```' + errs + '```' } });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Execution ' + $execution.id + ' - no customer was messaged on any skipped cart (fail-safe: silence over a wrong message).' }] });\n\nreturn [{ json: {\n  degraded: degraded,\n  summary: summary,\n  slack_body: { channel: '#automation-errors', text: 'Sweep degraded: ' + (headline || 'see run_logs'), blocks: blocks }\n} }];"
+        },
+        "notes": "ONE alert per sweep, never per cart: a Shopify outage across 50 due carts produces a single Slack message, not 50. Degraded = any failed row, any cart skipped on an unknown Shopify state, any Twilio send failure, a dead cart queue, or a run_logs read-back that itself failed.\n\nA cart closed as undeliverable is counted but does NOT make the sweep degraded - a dead number is a campaign outcome, not a system fault."
+      },
+      {
+        "id": "sweep-log",
+        "name": "Log Sweep Summary",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1520,
+          20
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: null, status: $json.degraded ? 'partial' : 'success', step_name: 'sweep_summary', error_message: $json.degraded ? ('sweep degraded: ' + $json.slack_body.text).slice(0, 1000) : null, metadata: $json.summary }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "One row per NON-EMPTY sweep. Empty sweeps never reach here (Prepare Cart Queue returns zero items, so nothing downstream executes) - the 'don't log 96 idle sweeps a day' decision from M3.1 still holds. This row is what the daily digest reads for sweep coverage.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "sweep-if-degraded",
+        "name": "Is Sweep Degraded",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1740,
+          20
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "c-degraded",
+                "leftValue": "={{ $('Build Sweep Summary').first().json.degraded }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "notes": "True only when the sweep did not do its job cleanly. A clean sweep writes its summary row and stops here - silence in #automation-errors means the queue was drained without incident."
+      },
+      {
+        "id": "sweep-alert",
+        "name": "Alert Degraded Sweep",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1980,
+          -60
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Build Sweep Summary').first().json.slack_body) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "notes": "Operational alert to #automation-errors (NOT #leads - that channel is for business events like a recovered order). Fills the gap the global error handler cannot: every degradation path in this sweep is Continue-On-Fail by design, so none of it ever crashes and none of it would otherwise be seen until the next morning's digest.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 4,
+        "waitBetweenTries": 3000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "note-sweep-summary",
+        "name": "Note - Sweep summary + degraded alert",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1080,
+          -420
+        ],
+        "parameters": {
+          "width": 720,
+          "height": 340,
+          "content": "## Sweep summary + degraded alert (M5.2b)\nEvery degradation path in this workflow is **Continue-On-Fail by design** - a Shopify outage skips carts, a Twilio failure postpones a touch, a closed window defers one. None of them crash, so **none of them ever reach `99 - Error Handler C2`**, which only fires on unhandled errors.\n\nWithout this block, a Shopify outage that skipped all 50 due carts would look exactly like a quiet afternoon until someone read `run_logs` or the 08:00 digest arrived.\n\n`Summarize Sweep` re-reads this execution's own `run_logs` rows by `execution_id` (not by accumulating loop output - the six terminal branches all return different item shapes), writes ONE `sweep_summary` row, and alerts **#automation-errors** only when something actually went wrong.\n\n**One alert per sweep, never per cart.** 50 skipped carts = 1 Slack message, not 50.\n\nA `run_logs` read-back that itself fails counts as degraded: observability that cannot read itself must not report a clean sweep.\n\nEmpty sweeps still write nothing at all - `Prepare Cart Queue` returns zero items, so nothing downstream executes (M3.1: no 96 idle rows a day)."
+        }
+      },
+      {
+        "id": "809cbe80-220c-48b4-84dc-2323b9ca4662",
+        "name": "Note - Arabic enforced in code, not asked for",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          3640,
+          -420
+        ],
+        "parameters": {
+          "height": 360,
+          "width": 720,
+          "content": "## The Arabic register layer lives in `Parse Touch Message`\n\nRegister compliance is **probabilistic**: the same prompt and the same cart, 15 minutes apart, produced one rejected generation and one clean one. So anything mechanically checkable is enforced here, and a message that fails is replaced by the respectful static template with the reason recorded in `degrade_reason` — visible in `run_logs` and the daily digest rather than invisible.\n\n**11 rules, all traceable to `prompts/arabic-style-guide.md`** (which derives from `arabic-master-reference.md` at the work root — Hussein owns both). Four of them exist because a wrong message was **delivered to a real handset** first.\n\n**Gender-conditional since 2026-08-07:** the MSA feminine present (`تستخدمين`) is correct for a customer we know to be female and an error otherwise. The colloquial dropped-ن form (`تستخدمي`) is wrong for everyone. `customer_gender` comes from intake and is sticky.\n\n**Deliberately high-precision, not exhaustive.** Over-matching would send every Arabic customer a template and silently delete the personalisation that is the point of the feature.\n\nRun `tests/parse-touch-message.test.js` after ANY edit to this node, the prompt, or the style guide — it loads `jsCode` out of the export, so **re-export first**."
+        }
+      },
+      {
+        "id": "route-send-fail",
+        "name": "Route Send Failure",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          5280,
+          620
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-terminal",
+                "leftValue": "={{ $json.delivery_terminal }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "notes": "Terminal delivery failure (the number cannot receive WhatsApp) closes the cart; everything else keeps the retry it has always had.\n\nOnly reachable from Did Send Succeed, which means Evaluate Delivery has run. The Did Twilio Accept false branch bypasses this on purpose: no SID means no delivery information at all, so there is nothing to classify and the cart must be retried."
+      },
+      {
+        "id": "close-undeliverable",
+        "name": "Close Undeliverable Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5500,
+          520
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $('Classify Conversion Result').first().json.id }}"
+              },
+              {
+                "name": "status",
+                "value": "in.(pending_verification,abandoned,recovering)"
+              },
+              {
+                "name": "opted_out",
+                "value": "is.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ status: 'undeliverable', next_touch_at: null }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "The number cannot receive WhatsApp, so stop: status undeliverable, schedule nulled, no further touches.\n\ntouches_sent is NOT incremented - the customer received nothing, and 'exhausted' would claim three delivered messages that never arrived.\n\nSame status + opted_out guard as the other cart writers here. A cart that converted or opted out while this sweep was mid-send must not be overwritten to undeliverable; that PATCH matches 0 rows instead and the run log says so.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-undeliverable",
+        "name": "Log Undeliverable Close",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          5720,
+          520
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Classify Conversion Result').first().json; var m = $('Parse Touch Message').first().json; var dv = $('Evaluate Delivery').first().json; var t = $('Send WhatsApp Touch (Twilio)').first().json; var patch = $('Close Undeliverable Cart').first().json; var pb = (patch && patch.body !== undefined) ? patch.body : patch; var rows = Array.isArray(pb) ? pb.length : 0; return { workflow_name: '02 - Verifier & Touch Sender', execution_id: $execution.id, cart_id: c.id, status: rows === 1 ? 'success' : 'partial', step_name: 'cart_closed_undeliverable', error_message: rows === 1 ? null : 'undeliverable close matched 0 rows - the cart was closed by another writer mid-sweep', metadata: { checkout_token: c.checkout_token, touch_number: m.touch_number, phone_country: c.country_code, twilio_sid: (t && t.sid) || null, delivery_status: dv.delivery_status, delivery_error_code: dv.delivery_error_code, touch_not_counted: true, touches_sent_at_close: c.touches_sent, rows_updated: rows, reason: 'recipient cannot receive WhatsApp' } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "Logged as SUCCESS, not failed, on purpose. A dead number is a normal outcome of running a recovery campaign, not a fault in this system, and marking it failed would flag every sweep that meets one as degraded and page the owner. It gets its own step_name and its own digest count instead, so it is visible without being an alarm.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      }
+    ],
+    "connections": {
+      "Every 15 Minutes": {
+        "main": [
+          [
+            {
+              "node": "Set Sweep Config",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Run Sweep Now (Testing)": {
+        "main": [
+          [
+            {
+              "node": "Set Sweep Config",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set Sweep Config": {
+        "main": [
+          [
+            {
+              "node": "Fetch Due Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Fetch Due Carts": {
+        "main": [
+          [
+            {
+              "node": "Prepare Cart Queue",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Prepare Cart Queue": {
+        "main": [
+          [
+            {
+              "node": "Did Fetch Fail",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Did Fetch Fail": {
+        "main": [
+          [
+            {
+              "node": "Log Fetch Failure",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Loop Over Carts": {
+        "main": [
+          [
+            {
+              "node": "Sweep Complete",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Check Conversion On Shopify",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Conversion On Shopify": {
+        "main": [
+          [
+            {
+              "node": "Classify Conversion Result",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Classify Conversion Result": {
+        "main": [
+          [
+            {
+              "node": "Route Conversion Outcome",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Conversion Outcome": {
+        "main": [
+          [
+            {
+              "node": "Close Converted Cart",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Get Send Window Config",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Conversion Check Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Close Converted Cart": {
+        "main": [
+          [
+            {
+              "node": "Notify Slack Conversion",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Notify Slack Conversion": {
+        "main": [
+          [
+            {
+              "node": "Log Conversion Close",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Conversion Close": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Conversion Check Failure": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get Send Window Config": {
+        "main": [
+          [
+            {
+              "node": "Resolve Send Context",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Resolve Send Context": {
+        "main": [
+          [
+            {
+              "node": "Needs Prayer Check",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Needs Prayer Check": {
+        "main": [
+          [
+            {
+              "node": "Get Prayer Times",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Apply Send Gate",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get Prayer Times": {
+        "main": [
+          [
+            {
+              "node": "Resolve Prayer Delay",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Resolve Prayer Delay": {
+        "main": [
+          [
+            {
+              "node": "Apply Send Gate",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Apply Send Gate": {
+        "main": [
+          [
+            {
+              "node": "Route Send Gate",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Send Gate": {
+        "main": [
+          [
+            {
+              "node": "Push Next Touch To Window",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Build Touch Message Request",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Push Next Touch To Window": {
+        "main": [
+          [
+            {
+              "node": "Log Send Window Deferral",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Send Window Deferral": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Touch Message Request": {
+        "main": [
+          [
+            {
+              "node": "Generate Touch Message (Sonnet)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Generate Touch Message (Sonnet)": {
+        "main": [
+          [
+            {
+              "node": "Parse Touch Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Touch Message": {
+        "main": [
+          [
+            {
+              "node": "Send WhatsApp Touch (Twilio)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send WhatsApp Touch (Twilio)": {
+        "main": [
+          [
+            {
+              "node": "Did Twilio Accept",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Did Twilio Accept": {
+        "main": [
+          [
+            {
+              "node": "Wait Before Delivery Check",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Postpone After Send Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Wait Before Delivery Check": {
+        "main": [
+          [
+            {
+              "node": "Check Delivery Status",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check Delivery Status": {
+        "main": [
+          [
+            {
+              "node": "Evaluate Delivery",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Evaluate Delivery": {
+        "main": [
+          [
+            {
+              "node": "Did Send Succeed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Did Send Succeed": {
+        "main": [
+          [
+            {
+              "node": "Update Cart After Touch",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Route Send Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Postpone After Send Failure": {
+        "main": [
+          [
+            {
+              "node": "Log Send Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Send Failure": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Update Cart After Touch": {
+        "main": [
+          [
+            {
+              "node": "Log Touch Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Touch Message": {
+        "main": [
+          [
+            {
+              "node": "Log Touch Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Touch Run": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Sweep Complete": {
+        "main": [
+          [
+            {
+              "node": "Summarize Sweep",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Fetch Failure": {
+        "main": [
+          [
+            {
+              "node": "Summarize Sweep",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Summarize Sweep": {
+        "main": [
+          [
+            {
+              "node": "Build Sweep Summary",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Sweep Summary": {
+        "main": [
+          [
+            {
+              "node": "Log Sweep Summary",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Sweep Summary": {
+        "main": [
+          [
+            {
+              "node": "Is Sweep Degraded",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Sweep Degraded": {
+        "main": [
+          [
+            {
+              "node": "Alert Degraded Sweep",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Send Failure": {
+        "main": [
+          [
+            {
+              "node": "Close Undeliverable Cart",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Postpone After Send Failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Close Undeliverable Cart": {
+        "main": [
+          [
+            {
+              "node": "Log Undeliverable Close",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Undeliverable Close": {
+        "main": [
+          [
+            {
+              "node": "Loop Over Carts",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "saveExecutionProgress": true,
+      "saveManualExecutions": true
+    },
+    "staticData": {
+      "node:Every 15 Minutes": {
+        "recurrenceRules": [
+          null
+        ],
+        "recurrenceRuleSignatures": [
+          null
+        ]
+      }
+    },
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "d189fd5b-3533-41a3-b3b8-305af0244db9",
+    "activeVersionId": "d189fd5b-3533-41a3-b3b8-305af0244db9",
+    "versionCounter": 55,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-02T22:24:30.791Z",
+        "createdAt": "2026-08-02T22:24:30.791Z",
+        "role": "workflow:owner",
+        "workflowId": "Ego90ZQGHf48Awe9",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

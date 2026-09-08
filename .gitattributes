@@ -1,0 +1,32 @@
+# Line endings are normalised to LF in the repo and on checkout.
+#
+# This machine has core.autocrlf=true, which would otherwise hand a Windows
+# clone CRLF copies of everything. Two concrete consequences, not theoretical:
+#
+#   1. tests/*.test.js run under Node on any host, and
+#      tests/send-signed-shopify-webhook.ps1 signs a raw body — line endings in
+#      a fixture change the bytes an HMAC is computed over.
+#   2. The workflow JSONs are exported byte-for-byte from the running n8n
+#      instance and re-verified against it. A checkout that silently rewrites
+#      their line endings breaks exactly the property the export process exists
+#      to guarantee.
+#
+# Backported from Case Study 3, which hit this first.
+
+* text=auto eol=lf
+
+*.json  text eol=lf
+*.js    text eol=lf
+*.sh    text eol=lf
+*.ps1   text eol=lf
+*.sql   text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.csv   text eol=lf
+
+# Binary — never touch these.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary

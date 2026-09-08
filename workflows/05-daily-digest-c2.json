@@ -1,0 +1,346 @@
+[
+  {
+    "updatedAt": "2026-08-26T09:32:04.976Z",
+    "createdAt": "2026-08-04T15:19:04.986Z",
+    "id": "luMDy2B0afajFyvA",
+    "name": "[CS2 Cart] 05 - Daily Digest",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "trg-cron",
+        "name": "Every Day 08:00",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          0,
+          220
+        ],
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "cronExpression",
+                "expression": "0 8 * * *"
+              }
+            ]
+          }
+        },
+        "notes": "08:00 Asia/Dubai (workflow timezone). Gulf and Levant working days both start before this, so the operator reads yesterday's recovery numbers before the store gets busy."
+      },
+      {
+        "id": "trg-manual",
+        "name": "Run Digest Now (Testing)",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          0,
+          400
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "window",
+        "name": "Compute Window",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          240,
+          300
+        ],
+        "parameters": {
+          "jsCode": "// Yesterday 00:00 -> 00:00 in the store's operating timezone, not UTC days.\n// A Gulf store's yesterday ends at 20:00 UTC; an order at 21:00 UTC belongs to\n// the next business day, not to this digest.\nconst zone = 'Asia/Dubai';\nconst todayStart = $now.setZone(zone).startOf('day');\nreturn [{ json: {\n  p_start: todayStart.minus({ days: 1 }).toISO(),\n  p_end: todayStart.toISO(),\n  zone: zone\n} }];"
+        }
+      },
+      {
+        "id": "fetch-stats",
+        "name": "Fetch Digest Stats",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          480,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/rpc/case2_daily_digest",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ p_start: $json.p_start, p_end: $json.p_end }) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "One RPC returns the whole day as a single JSON object - no raw cart or message rows cross the wire, and the aggregation lives where the data is. neverError so a DB blip produces a 'digest unavailable' Slack message instead of silence.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 2000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "build-digest",
+        "name": "Build Digest Message",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          720,
+          300
+        ],
+        "parameters": {
+          "jsCode": "const resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst raw = (resp && resp.body !== undefined) ? resp.body : resp;\nconst s = Array.isArray(raw) ? (raw[0] || {}) : (raw || {});\nconst ok = httpCode === 200 && s && s.window_start;\n\n// Money formatting per arabic-style-guide 3.1 (Hussein, 2026-08-04): Western\n// digits, thousands separators, currency code AFTER the number, no pointless\n// decimals. Same rule the customer-facing messages use, so the owner's digest\n// and the customer's message quote figures the same way.\nconst ZERO_DECIMAL = ['LBP','IQD','JPY','KRW','VND','CLP','ISK'];\nfunction fmtMoney(amount, cur) {\n  const c = String(cur || '').toUpperCase();\n  const n = Number(amount);\n  if (!isFinite(n)) return String(amount) + ' ' + c;\n  const dp = (ZERO_DECIMAL.indexOf(c) >= 0 || Math.abs(n - Math.round(n)) <= 0.004) ? 0 : 2;\n  return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp }) + ' ' + c;\n}\n// NEVER summed across currencies: a Lebanese order is booked in AED while the\n// customer paid in LBP, so one total would be a fiction.\nfunction money(map) {\n  const ks = Object.keys(map || {});\n  if (!ks.length) return 'none';\n  return ks.map(k => fmtMoney(map[k], k)).join('   ');\n}\nfunction byNum(map) {\n  const ks = Object.keys(map || {}).sort();\n  if (!ks.length) return 'none';\n  return ks.map(k => 'touch ' + k + ': ' + map[k]).join('   ');\n}\n\n// Label the day from the LOCAL window we asked for, not from the RPC's echo.\n// Postgres normalises the timestamptz to UTC on the way back, so a Dubai day\n// starting 2026-08-03T00:00+04:00 returns as 2026-08-02T20:00+00:00 and slicing\n// that gives the wrong date - the digest for the 3rd would be headed 'the 2nd'.\nconst win = $('Compute Window').first().json;\nconst day = win && win.p_start ? String(win.p_start).slice(0, 10) : '(unknown day)';\n\nif (!ok) {\n  const text = 'Cart recovery digest ' + day + ' UNAVAILABLE - digest query failed (HTTP ' + httpCode + ')';\n  return [{ json: { ok: false, stats: {}, slack_body: { channel: '#automation-errors', text: text,\n    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*' + text + '*\\nThe recovery system may be running fine - this is the reporting layer failing. Check run_logs directly.' } }] } } }];\n}\n\nconst rate = (s.recovery_rate_pct === null || s.recovery_rate_pct === undefined)\n  ? 'no attempts closed'\n  : (s.recovery_rate_pct + '%  (' + s.recovered_orders + ' of ' + s.recovery_attempts_closed + ' closed attempts)');\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: 'Cart recovery digest - ' + day, emoji: false } },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: '*Recovered orders:*\\n' + (s.recovered_orders || 0) },\n    { type: 'mrkdwn', text: '*Recovered revenue:*\\n' + money(s.recovered_revenue) },\n    { type: 'mrkdwn', text: '*Recovery rate:*\\n' + rate },\n    { type: 'mrkdwn', text: '*Carts tracked:*\\n' + (s.carts_created || 0) }\n  ]},\n  { type: 'section', text: { type: 'mrkdwn', text: '*Bought before any message:* ' + (s.converted_before_first_touch || 0) + '  (' + money(s.pre_touch_revenue) + ') - _not counted as recovery_' } },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: '*Touches sent:*\\n' + (s.touches_total || 0) + '  (' + byNum(s.touches_by_number) + ')' },\n    { type: 'mrkdwn', text: '*Replies / opt-outs:*\\n' + (s.replies_received || 0) + ' in, ' + (s.replies_handled || 0) + ' handled, ' + (s.opt_outs || 0) + ' opt-outs' },\n    { type: 'mrkdwn', text: '*Sequences exhausted:*\\n' + (s.exhausted || 0) },\n    { type: 'mrkdwn', text: '*Auto-replies sent:*\\n' + (s.auto_replies_sent || 0) }\n  ]},\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: '*Deferred (window/prayer/age):*\\n' + (s.deferrals || 0) },\n    { type: 'mrkdwn', text: '*Skipped (Shopify unknown):*\\n' + (s.skipped_api_failure || 0) },\n    { type: 'mrkdwn', text: '*Send failures:*\\n' + (s.send_failures || 0) },\n    { type: 'mrkdwn', text: '*Sweeps / degraded:*\\n' + (s.sweeps_logged || 0) + ' / ' + (s.sweeps_degraded || 0) }\n  ]},\n  { type: 'context', elements: [{ type: 'mrkdwn', text: 'Intake: ' + (s.carts_created || 0) + ' created, ' + (s.cart_updates || 0) + ' cart edits, ' + (s.no_phone_skips || 0) + ' skipped with no phone, ' + (s.hmac_failures || 0) + ' HMAC rejections, ' + (s.duplicate_inbound || 0) + ' duplicate inbound dropped  |  runs ' + (s.runs_total || 0) + ' (' + (s.runs_partial || 0) + ' partial, ' + (s.runs_failed || 0) + ' failed)' }] }\n];\n\nconst errs = Array.isArray(s.errors) ? s.errors : [];\nif (errs.length) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*Failures:*\\n' + errs.slice(0, 5)\n    .map(e => '- ' + (e.workflow || '?') + ' / ' + (e.step || '?') + ' - ' + String(e.error || '').slice(0, 120)).join('\\n') } });\n} else {\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No failed runs in the window.' }] });\n}\n\nconst text = 'Cart recovery digest ' + day + ': ' + (s.recovered_orders || 0) + ' recovered (' + money(s.recovered_revenue) + '), ' + (s.touches_total || 0) + ' touches, ' + (s.runs_failed || 0) + ' failures';\nreturn [{ json: { ok: true, stats: s, slack_body: { channel: '#leads', text: text, blocks: blocks } } }];"
+        },
+        "notes": "Formats the RPC result. Two rules it must never break: revenue is reported PER CURRENCY and never summed, and converted_before_first_touch appears on its own line explicitly marked as not a recovery (locked decision #9 - the honest-attribution rule this case study is partly built to demonstrate)."
+      },
+      {
+        "id": "post-slack",
+        "name": "Post Digest To Slack",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          960,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Build Digest Message').item.json.slack_body) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "notes": "Posts to #leads (business channel, same as the recovered-order notifications). A failed digest query posts to #automation-errors instead - the channel is chosen in Build Digest Message, not here. 4 tries / 3s against intermittent egress resets.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 4,
+        "waitBetweenTries": 3000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-digest",
+        "name": "Log Digest Run",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1200,
+          300
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var d = $('Build Digest Message').first().json; var slack = $('Post Digest To Slack').first().json; var sb = (slack && slack.body) ? slack.body : slack; var slackOk = !!(sb && sb.ok); var s = d.stats || {}; return { workflow_name: '05 - Daily Digest C2', execution_id: $execution.id, cart_id: null, status: (d.ok && slackOk) ? 'success' : 'partial', step_name: 'daily_digest', error_message: d.ok ? (slackOk ? null : 'digest built but Slack post failed') : 'digest query failed', metadata: { window_start: s.window_start, slack_ok: slackOk, carts_created: s.carts_created, touches_total: s.touches_total, recovered_orders: s.recovered_orders, recovered_revenue: s.recovered_revenue, converted_before_first_touch: s.converted_before_first_touch, recovery_rate_pct: s.recovery_rate_pct, runs_failed: s.runs_failed } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "Terminal. Records that the digest ran and what it reported, so a missing digest is distinguishable from a digest nobody read. status=partial if the query or the Slack post failed.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "note-digest",
+        "name": "Note - daily digest (Case 2)",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -40,
+          -60
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 260,
+          "content": "## 05 - Daily Digest C2\n08:00 Asia/Dubai, yesterday's window. One RPC (`case2_daily_digest`) does all the aggregation - no raw cart or message rows cross the wire.\n\n**Revenue is reported PER CURRENCY and never summed.** A Lebanese customer pays 42,663,000 LBP against an order the merchant books as 1,747.75 AED; one combined total would be a fiction. `carts.recovered_currency` (merchant/shopMoney) exists for exactly this and is distinct from `carts.currency` (what the customer saw).\n\n**`converted_before_first_touch` gets its own line, explicitly marked as not a recovery** (locked decision #9). A digest that quietly folded those into \"recovered\" would overstate the system's value to the client - which is the failure mode this case study is meant to argue against.\n\n`touches_total` counts recovery touches only. The opt-out confirmation and the holding reply carry `touch_number = null`, are reported separately as auto-replies, and never count against the 3-touch cap."
+        }
+      }
+    ],
+    "connections": {
+      "Every Day 08:00": {
+        "main": [
+          [
+            {
+              "node": "Compute Window",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Run Digest Now (Testing)": {
+        "main": [
+          [
+            {
+              "node": "Compute Window",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Compute Window": {
+        "main": [
+          [
+            {
+              "node": "Fetch Digest Stats",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Fetch Digest Stats": {
+        "main": [
+          [
+            {
+              "node": "Build Digest Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Digest Message": {
+        "main": [
+          [
+            {
+              "node": "Post Digest To Slack",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Post Digest To Slack": {
+        "main": [
+          [
+            {
+              "node": "Log Digest Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp"
+    },
+    "staticData": {
+      "node:Every Day 08:00": {
+        "recurrenceRules": [
+          null
+        ],
+        "recurrenceRuleSignatures": [
+          null
+        ]
+      }
+    },
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "e4cfdf3e-c065-4b19-9b7e-829cb7321c5c",
+    "activeVersionId": "e4cfdf3e-c065-4b19-9b7e-829cb7321c5c",
+    "versionCounter": 11,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-04T15:19:04.995Z",
+        "createdAt": "2026-08-04T15:19:04.995Z",
+        "role": "workflow:owner",
+        "workflowId": "luMDy2B0afajFyvA",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

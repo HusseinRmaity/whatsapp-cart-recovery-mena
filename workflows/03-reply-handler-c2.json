@@ -1,0 +1,1589 @@
+[
+  {
+    "updatedAt": "2026-09-03T12:27:46.321Z",
+    "createdAt": "2026-08-03T21:48:26.546Z",
+    "id": "C2ReplyHandlr002",
+    "name": "[CS2 Cart] 03 - Reply Handler",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "note-reply",
+        "name": "Note - 03 - Reply Handler C2",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -320,
+          -80
+        ],
+        "parameters": {
+          "width": 720,
+          "height": 300,
+          "content": "## 03 - Reply Handler C2\nReceives customer replies forwarded by `03r - Inbound Router` (Twilio's sandbox allows one inbound\nURL for both case studies). Reachable on its own path, so it can be tested without the router.\n\nOrder: match cart by phone (30 days) -> record the inbound -> opt-out -> classify -> route.\nAn unmatched phone exits silently with a log row: replying \"who are you?\" to a stranger is worse\nthan saying nothing.\n\nThe touch schedule is NEVER modified here except by an opt-out. A customer asking about delivery\nhas not withdrawn consent, and touch 2 still has a job to do."
+        }
+      },
+      {
+        "id": "note-optout",
+        "name": "Note - Opt-out is a compliance control, not a classification",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1500,
+          -80
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 300,
+          "content": "## Opt-out is a compliance control, not a classification\nThe keyword check runs BEFORE the model and short-circuits straight to suppression. We tell the\ncustomer \"reply STOP\" / \"للإيقاف أرسل: توقف\", so a customer who does exactly that must be honoured\nwith certainty rather than with high probability - the same rule that keeps the recovery link and\nthe opt-out line out of the model's hands.\n\nThe model still has an `opt_out` class for the phrasings a keyword list cannot catch (\"please\ndon't message me again\", \"لا أريد رسائل\"), and is told to lean toward suppression when unsure.\n\nSuppression is permanent and per cart: `opted_out = true`, `next_touch_at = null`, status\n`opted_out`. The PATCH filters on `opted_out=eq.false`, so a second STOP updates 0 rows and cannot\nsend a second confirmation. `Fetch Due Carts` in workflow 02 already excludes opted-out carts, so\ntouches 2 and 3 stop by construction."
+        }
+      },
+      {
+        "id": "wh-reply",
+        "name": "Receive Reply Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          -320,
+          400
+        ],
+        "webhookId": "c2a10d54-6f31-4a6e-9d1e-2f0b7a1c9e02",
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "whatsapp-inbound-c2",
+          "responseMode": "onReceived",
+          "options": {}
+        }
+      },
+      {
+        "id": "parse-inbound",
+        "name": "Parse Inbound Message",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -100,
+          400
+        ],
+        "parameters": {
+          "jsCode": "// Identical to Case 1's parser and the router's, so the same Twilio payload is\n// read the same way wherever it lands.\nconst b = $json.body || $json;\nconst rawFrom = (b.From || b.from || '').toString();\nconst phone = rawFrom.replace(/^whatsapp:/i, '').replace(/[\\s\\-()]/g, '').trim();\nlet message = (b.Body || b.body || '').toString().trim();\nconst sid = (b.MessageSid || b.SmsMessageSid || b.SmsSid || '').toString();\n\n// ---------------------------------------------------------------------------\n// MEDIA (added 2026-09-01, found by the FIRST voice note ever sent to Case 2).\n//\n// The router gained placeholder substitution on 2026-08-21, but it forwards the\n// ORIGINAL Twilio payload by design - its own note says \"the handler must not be\n// able to tell\" - so that substitution NEVER reaches this workflow. Each handler\n// has to do its own media handling.\n//\n// This parser still carried the pre-2026-08-21 rule `skip = (!phone || !message)`,\n// and a WhatsApp voice note arrives with an EMPTY Body and NumMedia>=1. So every\n// voice note to Case 2 was silently dropped: no cart_messages row, no Slack, no\n// holding reply. The customer answered and got silence, and the comment above\n// claimed this parser matched the router's while it had not since 2026-08-21.\n//\n// Voice notes are a dominant WhatsApp modality in the Gulf and Levant. This was a\n// hole on the customer-facing path, not an edge case.\n// ---------------------------------------------------------------------------\nconst numMedia = parseInt((b.NumMedia || b.numMedia || '0').toString(), 10) || 0;\nconst mediaType = (b.MediaContentType0 || '').toString().toLowerCase();\nconst hasMedia = numMedia > 0;\nlet mediaKind = null;\nif (hasMedia) {\n  if (mediaType.indexOf('audio') === 0) mediaKind = 'voice';\n  else if (mediaType.indexOf('image') === 0) mediaKind = 'image';\n  else if (mediaType.indexOf('video') === 0) mediaKind = 'video';\n  else if (mediaType.indexOf('application/pdf') === 0) mediaKind = 'document';\n  else mediaKind = 'attachment';\n  if (!message) {\n    const label = { voice: '[voice note]', image: '[image]', video: '[video]', document: '[document]', attachment: '[attachment]' };\n    message = label[mediaKind];\n  }\n}\n\nconst skip = (!phone || !message);\n\nreturn [{ json: {\n  inbound_phone: phone,\n  inbound_message: message,\n  inbound_sid: sid,\n  has_media: hasMedia,\n  media_kind: mediaKind,\n  media_type: mediaType || null,\n  num_media: numMedia,\n  skip: skip\n} }];"
+        }
+      },
+      {
+        "id": "if-valid",
+        "name": "Route Valid Inbound",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          120,
+          400
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-valid",
+                "leftValue": "={{ $json.skip }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "false",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-skipped",
+        "name": "Log Skipped Inbound",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          640
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: null, status: 'success', step_name: 'inbound_skipped', metadata: { phone: $json.inbound_phone || null, reason: 'empty body or missing phone' } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "match-cart",
+        "name": "Match Cart By Phone",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          400
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "*"
+              },
+              {
+                "name": "phone",
+                "value": "=eq.{{ $json.inbound_phone }}"
+              },
+              {
+                "name": "created_at",
+                "value": "=gte.{{ $now.minus({ days: 30 }).toUTC().toISO() }}"
+              },
+              {
+                "name": "order",
+                "value": "created_at.desc"
+              },
+              {
+                "name": "limit",
+                "value": "20"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Candidate carts in a 30-day lookback (spec §5), newest first, bounded at 20. pickCart in Resolve Reply Context chooses which one owns the conversation. NOT limit=1: that let a newer CLOSED cart absorb an opt-out meant for an older open cart (2026-09-02)."
+      },
+      {
+        "id": "resolve-ctx",
+        "name": "Resolve Reply Context",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          560,
+          400
+        ],
+        "parameters": {
+          "jsCode": "const inbound = $('Parse Inbound Message').first().json;\nconst resp = $input.first().json;\nconst httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\nconst body = resp ? resp.body : null;\n\nconst lookupOk = (httpCode === 200 && Array.isArray(body));\n// ---------------------------------------------------------------------------\n// PICK THE CART THAT OWNS THE CONVERSATION, do not trust the first row.\n//\n// MUST stay identical to pickCart in the router's `Decide Route`. If the router\n// forwards on cart X and this node acts on cart Y, the system answers a\n// conversation it did not route. n8n Code nodes cannot import a shared module,\n// so the duplication is deliberate - the same reason fmtMoney and register_zone\n// below are duplicated from workflow 02 - and tests/resolve-reply-context.test.js\n// asserts the two status lists still match.\n//\n// Here the bug was a COMPLIANCE failure, not just a routing one. `route` is\n// derived from the chosen cart and `Suppress Cart` acts on it, so with\n// `limit=1` a customer holding an active cart A and a newer CONVERTED cart B\n// who replied `توقف` had cart B suppressed - already closed, sending nothing -\n// while cart A carried on messaging them, and the run log called it a success.\n// Found live 2026-09-02.\n// ---------------------------------------------------------------------------\nconst CASE2_STATUSES = ['pending_verification', 'abandoned', 'recovering', 'exhausted'];\n\nfunction pickCart(list) {\n  if (!list || !list.length) return null;\n  // 1. A cart that still owns the conversation, most recent first.\n  const live = list.filter(function (r) {\n    return CASE2_STATUSES.indexOf(r.status) >= 0 && r.opted_out !== true;\n  }).sort(function (a, b) {\n    return Date.parse(b.created_at) - Date.parse(a.created_at);\n  });\n  if (live.length) return live[0];\n  // 2. A suppressed cart, so a repeat STOP is still swallowed by us.\n  const supp = list.filter(function (r) { return r.opted_out === true; })\n    .sort(function (a, b) { return Date.parse(b.created_at) - Date.parse(a.created_at); });\n  if (supp.length) return supp[0];\n  // 3. Otherwise the most recent closed row, kept for context and logging.\n  return list.slice().sort(function (a, b) {\n    return Date.parse(b.created_at) - Date.parse(a.created_at);\n  })[0];\n}\n\nconst cart = lookupOk ? pickCart(body) : null;\n\n// ---- money, formatted in code exactly as workflow 02 does it -----------------\n// Style guide 3.1 (Hussein, 2026-08-04): Western digits, thousands separators,\n// currency code AFTER the number, no pointless decimals. Used in the Slack\n// notification so the owner sees the same figure the customer was quoted.\nfunction fmtMoney(amount, currency) {\n  const cur = String(currency || '').toUpperCase();\n  if (amount === null || amount === undefined || amount === '') return cur;\n  const n = Number(amount);\n  if (!isFinite(n)) return String(amount) + (cur ? ' ' + cur : '');\n  const ZERO_DECIMAL = ['LBP','IQD','JPY','KRW','VND','CLP','ISK'];\n  const zero = ZERO_DECIMAL.indexOf(cur) >= 0;\n  const hasCents = Math.abs(n - Math.round(n)) > 0.004;\n  const dp = (zero || !hasCents) ? 0 : 2;\n  return (cur ? (n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp }) + ' ' + cur)\n              : n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp }));\n}\n\n// ---- register zone, same rule as Build Touch Message Request ----------------\nconst LEVANT_EGYPT = ['LB','JO','SY','PS','EG'];\nconst GULF = ['AE','SA','QA','KW','BH','OM'];\nconst cc = String((cart && cart.country_code) || '').toUpperCase();\nconst register_zone = LEVANT_EGYPT.indexOf(cc) >= 0 ? 'levant_egypt'\n                    : (GULF.indexOf(cc) >= 0 ? 'gulf' : 'other');\n\n// ---- opt-out keywords, checked BEFORE any model call ------------------------\n// We instruct the customer to reply STOP / توقف, so obeying that instruction has\n// to work every time, not usually. Matched on the whole trimmed message and on a\n// leading word, so \"STOP\" and \"stop please\" both count while \"don't stop sending\n// me these, they're useful\" does not.\nconst msg = (inbound.inbound_message || '').trim();\n// Quote characters are stripped as well as punctuation. The touch-1 opt-out\n// line now reads لإيقاف الرسائل، أرسل \"توقف\" (canonical wording,\n// arabic-master-reference.md §8.5), so the keyword the customer is shown is QUOTED - and\n// copying it back verbatim is the most likely way for them to send it. Without\n// this, \"توقف\" would fail both the exact-match and the prefix test and a\n// genuine opt-out would be treated as an ordinary reply. Compliance control:\n// it must not depend on the customer stripping our own punctuation.\nconst normalised = msg.toLowerCase().replace(/[.!،؟?\"'«»“”„‘’‹›]/g, ' ').replace(/\\s+/g, ' ').trim();\nconst KEYWORDS = ['stop', 'unsubscribe', 'arret', 'arrêt', 'arretez', 'arrêtez',\n                  '\\u062A\\u0648\\u0642\\u0641',            // توقف\n                  '\\u0627\\u0644\\u063A\\u0627\\u0621',      // الغاء\n                  '\\u0625\\u0644\\u063A\\u0627\\u0621'];     // إلغاء\nlet keywordHit = null;\nfor (const k of KEYWORDS) {\n  if (normalised === k || normalised.indexOf(k + ' ') === 0) { keywordHit = k; break; }\n}\n\n// ---- route ------------------------------------------------------------------\nlet route = 'classify';\nif (!cart) route = 'no_match';\nelse if (cart.opted_out === true) route = 'already_suppressed';\nelse if (keywordHit) route = 'opt_out_keyword';\n\nconst items = (cart && Array.isArray(cart.cart_items)) ? cart.cart_items : [];\nconst named = items.slice(0, 2).map(function (i) { return (i.title || 'item') + ' \\u00d7' + (i.quantity || 1); });\nconst extra = items.length - named.length;\n\nreturn [{ json: {\n  route: route,\n  lookup_ok: lookupOk,\n  lookup_status_code: httpCode,\n  has_cart: !!cart,\n  keyword_hit: keywordHit,\n  cart_id: cart ? cart.id : null,\n  checkout_token: cart ? cart.checkout_token : null,\n  cart_status: cart ? cart.status : null,\n  touches_sent: cart ? cart.touches_sent : null,\n  next_touch_at: cart ? cart.next_touch_at : null,\n  customer_first_name: cart ? cart.customer_first_name : null,\n  phone: inbound.inbound_phone,\n  language: (cart && ['ar','en','fr','mixed'].indexOf(cart.language) >= 0) ? cart.language : 'en',\n  country_code: cart ? cart.country_code : null,\n  register_zone: register_zone,\n  items_summary: named.join('; ') + (extra > 0 ? ('; and ' + extra + ' more') : ''),\n  item_count: items.length,\n  total_display: cart ? fmtMoney(cart.cart_total, cart.currency) : null,\n  recovery_url: cart ? cart.recovery_url : null,\n  inbound_message: msg,\n  inbound_sid: inbound.inbound_sid,\n\n  // Carried through for the holding-reply rule (ruled 2026-09-01). The parser\n  // derives these from NumMedia / MediaContentType0 on the raw Twilio payload.\n  has_media: inbound.has_media === true,\n  media_kind: inbound.media_kind || null\n} }];"
+        },
+        "notes": "Opt-out keywords, register zone and money formatting all resolved here"
+      },
+      {
+        "id": "if-match",
+        "name": "Has Cart Match",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          780,
+          400
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-match",
+                "leftValue": "={{ $json.has_cart }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-nomatch",
+        "name": "Log No Cart Match",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1000,
+          640
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: null, status: $json.lookup_ok ? 'success' : 'failed', step_name: 'no_cart_match', error_message: $json.lookup_ok ? null : ('cart lookup returned HTTP ' + $json.lookup_status_code), metadata: { phone: $json.phone, twilio_sid: $json.inbound_sid, message_chars: $json.inbound_message.length, action: 'silent_exit' } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Silent exit: never answer a phone we cannot identify"
+      },
+      {
+        "id": "log-inbound-msg",
+        "name": "Log Inbound Message",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1000,
+          400
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/cart_messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ cart_id: $json.cart_id, direction: 'inbound', touch_number: null, message: $json.inbound_message, twilio_message_id: $json.inbound_sid || null }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Writes the inbound reply to cart_messages AND acts as the idempotency lock (M5.2b).\n\nTwilio retries an inbound webhook it does not get a timely 200 for. `uniq_cart_messages_inbound_sid` (partial unique index on twilio_message_id where direction='inbound') turns that retry into a 409 here, which `Is Duplicate Inbound` routes to a log-and-exit - so the customer never gets a second holding reply for one message they sent once.\n\nInsert-as-lock, not SELECT-then-INSERT: two concurrent retries can both pass a read check, but only one can win the unique index. fullResponse is what makes the 409 visible; neverError keeps it out of the error path since a duplicate is a normal event, not a failure."
+      },
+      {
+        "id": "route-reply",
+        "name": "Route Reply Path",
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3,
+        "position": [
+          1220,
+          400
+        ],
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-suppressed",
+                      "leftValue": "={{ $('Resolve Reply Context').first().json.route }}",
+                      "rightValue": "already_suppressed",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "already_suppressed"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-keyword",
+                      "leftValue": "={{ $('Resolve Reply Context').first().json.route }}",
+                      "rightValue": "opt_out_keyword",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "opt_out_keyword"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-classify",
+                      "leftValue": "={{ $('Resolve Reply Context').first().json.route }}",
+                      "rightValue": "classify",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "classify"
+              }
+            ]
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-suppressed",
+        "name": "Log Already Suppressed",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1500,
+          240
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; return { workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: c.cart_id, status: 'success', step_name: 'reply_from_opted_out_cart', metadata: { checkout_token: c.checkout_token, phone: c.phone, keyword_hit: c.keyword_hit, action: 'silent_exit_no_reply', reason: 'suppression is permanent - a second STOP gets no second confirmation' } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Recorded, but nothing is sent - permanent means permanent"
+      },
+      {
+        "id": "classify",
+        "name": "Classify Reply Intent (Haiku)",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1500,
+          560
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.anthropic.com/v1/messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "anthropicApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "anthropic-version",
+                "value": "2023-06-01"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; var system = [\n'You classify ONE inbound WhatsApp message from a customer of a MENA online store. The store sent',\n'them a message about a shopping cart they abandoned; this is their reply. Assign ONE intent.',\n'',\n'Intents:',\n'- \"opt_out\"      They want the messages to stop. Any request to unsubscribe, stop, be removed, or',\n'                 be left alone - however politely or rudely phrased, in any language. Also anger',\n'                 directed at being messaged at all.',\n'- \"wants_to_buy\" They intend to complete the purchase or are asking to be helped to complete it:',\n'                 \"I will take it\", \"how do I pay\", \"can you send the link again\", \"is cash on',\n'                 delivery available\", \"reserve it for me\".',\n'- \"question\"     A genuine question about the products, delivery, sizing, price, stock, returns,',\n'                 or the store - without a clear statement of intent to buy.',\n'- \"other\"        Anything else: a greeting with no content, a thank-you, an emoji, a wrong number,',\n'                 spam, or a message you cannot interpret.',\n'',\n'Rules:',\n'- Judge intent from substance, not politeness or length.',\n'- If a message contains BOTH a question and a clear intent to buy, choose \"wants_to_buy\".',\n'- If you are torn between \"opt_out\" and anything else, choose \"opt_out\". A customer who is',\n'  wrongly left alone loses the store one sale; a customer who is wrongly messaged again after',\n'  asking to stop is a compliance failure.',\n'- \"Not now\" / \"later\" / \"I changed my mind\" is NOT an opt-out - it is \"other\". They are declining',\n'  this cart, not the channel.',\n'- Arabic, Arabizi (Arabic in Latin letters), English, French and mixed messages are all normal',\n'  input. Judge them equally.',\n'- Output STRICT JSON only. No prose, no markdown, no code fences.',\n'',\n'Output shape:',\n'{\"intent\": \"wants_to_buy|question|opt_out|other\", \"reason\": \"<=12 word justification\"}'\n].join('\\n'); var user = [\n'Customer language on file: ' + c.language,\n'Touches sent so far: ' + c.touches_sent,\n'Cart: ' + (c.items_summary || '(unknown items)') + ' - ' + (c.total_display || '(unknown total)'),\n'Their message:',\nc.inbound_message\n].join('\\n'); return { model: 'claude-haiku-4-5-20251001', max_tokens: 100, system: system, messages: [{ role: 'user', content: user }] }; })()) }}",
+          "options": {
+            "timeout": 15000
+          }
+        },
+        "credentials": {
+          "anthropicApi": {
+            "id": "azRjMcNgGfj9c985",
+            "name": "Anthropic account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Haiku 4.5: a four-way bucket over a short message (prompts/reply-intent-classifier.md v1)"
+      },
+      {
+        "id": "parse-intent",
+        "name": "Parse Intent",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1720,
+          560
+        ],
+        "parameters": {
+          "jsCode": "const VALID = ['wants_to_buy', 'question', 'opt_out', 'other'];\n\nlet intent = 'other';\nlet reason = null;\nlet degraded = true;\nlet detail = 'no_response';\n\ntry {\n  const data = $input.first().json;\n  const d = (data && data.body) ? data.body : data;\n  if (d && Array.isArray(d.content)) {\n    const tb = d.content.find(function (b) { return b && b.type === 'text' && b.text; });\n    if (tb) {\n      const raw = tb.text.toString().trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n      const parsed = JSON.parse(raw);\n      if (parsed && VALID.indexOf(parsed.intent) >= 0) {\n        intent = parsed.intent;\n        reason = (parsed.reason || '').toString().slice(0, 120);\n        degraded = false;\n        detail = null;\n      } else {\n        detail = ('unexpected_intent: ' + JSON.stringify(parsed).slice(0, 120));\n      }\n    }\n  } else if (d && d.error) {\n    detail = ('api_error: ' + JSON.stringify(d.error)).slice(0, 200);\n  }\n} catch (e) { detail = 'parse_error'; }\n\n// A message we could not read is one a human should answer. Defaulting to\n// 'other' notifies the owner with the raw text and sends the customer NOTHING -\n// a holding reply promising a callback is a commitment not worth making on a\n// guess, and defaulting to opt_out would silently kill a live sequence.\nreturn [{ json: {\n  intent: intent,\n  intent_reason: reason,\n  intent_degraded: degraded,\n  intent_detail: detail,\n  intent_source: degraded ? 'default_fallback' : 'model'\n} }];"
+        },
+        "notes": "Failure defaults to 'other': notify a human, promise the customer nothing"
+      },
+      {
+        "id": "if-optout",
+        "name": "Is Opt Out Intent",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1940,
+          560
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-optout",
+                "leftValue": "={{ $json.intent }}",
+                "rightValue": "opt_out",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "suppress",
+        "name": "Suppress Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2160,
+          380
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "phone",
+                "value": "=eq.{{ $('Resolve Reply Context').first().json.phone }}"
+              },
+              {
+                "name": "status",
+                "value": "in.(pending_verification,abandoned,recovering,exhausted)"
+              },
+              {
+                "name": "opted_out",
+                "value": "eq.false"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ opted_out: true, next_touch_at: null, status: 'opted_out' }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Suppresses EVERY open cart for this phone, not one cart id.\n\nUntil 2026-09-02 this filtered id=eq.<the one cart pickCart chose>, so a customer holding two live carts who sent توقف had ONE suppressed and kept receiving touches from the other.\n\nThe status filter is the guard that matters: it restricts the write to OPEN carts, so a cart already closed as recovered / converted_before_first_touch is never overwritten and the converted_after_opt_out distinction survives. opted_out=eq.false keeps the write idempotent on a repeat STOP.\n\nrows_updated can now legitimately be 2+; Log Opt-Out Run treats >= 1 as success."
+      },
+      {
+        "id": "build-optout-msg",
+        "name": "Build Opt-Out Confirmation",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2380,
+          380
+        ],
+        "parameters": {
+          "jsCode": "const c = $('Resolve Reply Context').first().json;\nconst patch = $input.first().json;\nconst pb = (patch && patch.body !== undefined) ? patch.body : patch;\nconst rows = Array.isArray(pb) ? pb.length : 0;\n\nconst tlang = (c.language === 'mixed') ? 'ar' : c.language;\n\n// STATIC templates, not generated. One sentence confirming suppression carries\n// no personalisation worth a model call, and it is a compliance artefact that\n// must read identically every time.\n//\n// ALL THREE now describe PHONE-level suppression. Until 2026-09-02 every string\n// said \"about this cart\", which was accurate while a STOP suppressed one cart\n// and became an understatement the moment suppression moved to the phone.\n//\n// ARABIC: the vetted [OK] opt-out confirmation from arabic-master-reference.md\n// 8.5, adopted verbatim 2026-09-02 (6b.1 reopened). A fixed glossary string\n// (rule 0.2): never regenerate, paraphrase or inflect it. There is deliberately\n// NO register branch - a fixed string reads identically in every message.\n// Written raw rather than \\u-escaped, matching the FALLBACK templates in\n// workflow 02's Parse Touch Message: escapes are for the regex markers, raw\n// Arabic for customer-facing copy a reviewer has to be able to read.\n//\n// EN and FR: rewritten 2026-09-03. arabic-master-reference.md has no opt-out\n// confirmation in either language, so there was nothing to adopt - its EN/FR\n// table (8.7) covers waitlist and no-show only, and 8.9 covers the keywords a\n// customer TYPES, not the confirmation sent back. Per 8.7 these carry no\n// vetting gate; Hussein reads them. The edit is deliberately minimal: only the\n// cart-scoping clause changed, so the existing voice is preserved.\n//\n// The French keeps the impersonal \"C'est note\" opening on purpose. The natural\n// alternative, \"vous etes desinscrit\", takes a gendered past participle\n// (desinscrit / desinscrite) and we do not reliably know the customer's gender\n// here - the same trap the Arabic gender rules exist to avoid. \"de notre part\"\n// scopes the promise to this store: without it the sentence claims we can stop\n// messages we do not send.\nconst AR_OPTOUT = 'تم إيقاف الرسائل. شكراً لك';\n\nconst TEXT = {\n  ar: AR_OPTOUT,\n  en: 'You have been unsubscribed. We will not message you again.',\n  fr: \"C'est noté : vous ne recevrez plus de messages de notre part.\"\n};\n\nreturn [{ json: {\n  rows_updated: rows,\n  already_suppressed: rows === 0,\n  confirmation_text: TEXT[tlang] || TEXT.en,\n  language: c.language,\n  register_zone: c.register_zone\n} }];"
+        },
+        "notes": "Static per-language text; Arabic register per the style guide"
+      },
+      {
+        "id": "send-optout",
+        "name": "Send Opt-Out Confirmation",
+        "type": "n8n-nodes-base.twilio",
+        "typeVersion": 1,
+        "position": [
+          2600,
+          380
+        ],
+        "parameters": {
+          "resource": "sms",
+          "operation": "send",
+          "from": "+14155238886",
+          "to": "={{ $('Resolve Reply Context').first().json.phone }}",
+          "toWhatsapp": true,
+          "message": "={{ $json.confirmation_text }}"
+        },
+        "credentials": {
+          "twilioApi": {
+            "id": "i6W4hkBVTg5L0D9v",
+            "name": "Twilio account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Exactly one confirmation, ever (spec §7)"
+      },
+      {
+        "id": "log-optout-msg",
+        "name": "Log Opt-Out Message",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2820,
+          380
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/cart_messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ cart_id: $('Resolve Reply Context').first().json.cart_id, direction: 'outbound', touch_number: null, message: $('Build Opt-Out Confirmation').first().json.confirmation_text, twilio_message_id: ($json.sid || null) }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "touch_number null - a confirmation is not one of the three touches"
+      },
+      {
+        "id": "log-optout-run",
+        "name": "Log Opt-Out Run",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3040,
+          380
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; var b = $('Build Opt-Out Confirmation').first().json; var t = $('Send Opt-Out Confirmation').first().json; var src = 'keyword'; var intent = null; try { var pi = $('Parse Intent').first().json; if (pi) { src = pi.intent_source === 'model' ? 'model' : 'model_default'; intent = pi.intent; } } catch (e) {} return { workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: c.cart_id, status: (b.rows_updated >= 1 && t && t.sid) ? 'success' : 'partial', step_name: 'opt_out', error_message: b.rows_updated >= 1 ? null : 'suppression matched 0 rows - cart was already opted out', metadata: { checkout_token: c.checkout_token, phone: c.phone, detected_by: src, keyword_hit: c.keyword_hit, model_intent: intent, touches_sent_at_opt_out: c.touches_sent, rows_updated: b.rows_updated, language: b.language, register_zone: b.register_zone, twilio_sid: (t && t.sid) || null, remaining_touches_cancelled: true } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "build-notify",
+        "name": "Build Owner Notification",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2160,
+          700
+        ],
+        "parameters": {
+          "jsCode": "const c = $('Resolve Reply Context').first().json;\nconst i = $('Parse Intent').first().json;\n\nconst tlang = (c.language === 'mixed') ? 'ar' : c.language;\nconst name = c.customer_first_name || '(no name)';\n\n// A holding reply is sent only when the customer asked something a human will\n// answer. 'other' (a thumbs-up, a wrong number, or a message the classifier\n// could not read) gets no automated reply - promising a callback for an emoji\n// is worse than silence.\n//\n// MEDIA ALWAYS GETS A HOLDING REPLY. Ruled by Hussein 2026-09-01, after the first\n// voice note ever sent to Case 2 produced a Slack notification and NOTHING to the\n// customer. The rule above is right for a thumbs-up or a wrong number - we cannot\n// read it, so we promise nothing. A voice note is categorically different: the\n// customer unambiguously COMMUNICATED, we simply cannot transcribe it, and Haiku\n// correctly returns 'other' saying exactly that. Silence there is the same defect\n// we had just fixed one layer up, only later in the pipeline.\n//\n// The holding text claims only that the message reached the team and will be\n// answered - which for a media inbound is literally true, because the Slack\n// notification below is what makes it true. It commits to no time, price or\n// availability. Voice notes are a dominant WhatsApp modality in the Gulf and the\n// Levant, so this is a common path, not an edge case.\nconst needsHolding = (i.intent === 'wants_to_buy' || i.intent === 'question' || c.has_media === true);\n\n// STATIC per-language holding text. Nothing here is personalised, and it must\n// never invent a commitment (a time, a price, an availability). Arabic register\n// per prompts/arabic-style-guide.md 1.2; no إن شاء الله for timing (3).\n// ⚠ v1 wording, NOT yet reviewed by Hussein.\nconst AR_LEVANT = '\\u0634\\u0643\\u0631\\u0627\\u064B \\u0644\\u0631\\u0633\\u0627\\u0644\\u0629 \\u062D\\u0636\\u0631\\u062A\\u0643. \\u0648\\u0635\\u0644\\u062A \\u0625\\u0644\\u0649 \\u0641\\u0631\\u064A\\u0642\\u0646\\u0627 \\u0648\\u0633\\u064A\\u062A\\u0645 \\u0627\\u0644\\u0631\\u062F \\u0639\\u0644\\u064A\\u0647\\u0627 \\u0641\\u064A \\u0623\\u0642\\u0631\\u0628 \\u0648\\u0642\\u062A.';\nconst AR_PLAIN  = '\\u0634\\u0643\\u0631\\u0627\\u064B \\u0644\\u0631\\u0633\\u0627\\u0644\\u062A\\u0643. \\u0648\\u0635\\u0644\\u062A \\u0625\\u0644\\u0649 \\u0641\\u0631\\u064A\\u0642\\u0646\\u0627 \\u0648\\u0633\\u064A\\u062A\\u0645 \\u0627\\u0644\\u0631\\u062F \\u0639\\u0644\\u064A\\u0647\\u0627 \\u0641\\u064A \\u0623\\u0642\\u0631\\u0628 \\u0648\\u0642\\u062A.';\n\nconst HOLDING = {\n  ar: (c.register_zone === 'levant_egypt') ? AR_LEVANT : AR_PLAIN,\n  en: 'Thanks for your message. Our team has it and will reply shortly.',\n  fr: \"Merci pour votre message. Notre \\u00e9quipe l'a bien re\\u00e7u et vous r\\u00e9pondra rapidement.\"\n};\n\nconst ICON = { wants_to_buy: '\\ud83d\\uded2', question: '\\u2753', other: '\\ud83d\\udcac' };\nconst HEAD = {\n  wants_to_buy: 'wants to buy',\n  question: 'has a question',\n  other: 'replied'\n};\n\n// ---------------------------------------------------------------------------\n// SLACK LAYOUT - restructured 2026-09-08 on Hussein's instruction. Two changes,\n// both about how this is actually read: the owner sees it on a phone, in a\n// channel, and answers on WhatsApp.\n//\n// 1. BLOCK KIT instead of one long mrkdwn paragraph. The old message put the\n//    name, phone, cart, status and intent on five lines of running text, which\n//    is fine on a laptop and unreadable in a notification. A header carries who\n//    and what, the quote carries the customer's own words, and the rest sits in\n//    two-column fields that stay aligned on a narrow screen.\n//\n// 2. THE PHONE IS A wa.me LINK. It used to be a bare E.164 string, so answering\n//    meant copy, switch app, paste. The `+` MUST be stripped from the path -\n//    https://wa.me/+961... 404s while https://wa.me/961... opens the thread.\n//    The `+` is kept in the LABEL, because that is the number the owner reads.\n//\n// `slack_text` is no longer the message. It is the fallback Slack shows in the\n// sidebar, in a push notification and on a locked screen, so it stays short and\n// names the customer.\n// ---------------------------------------------------------------------------\nconst digits = String(c.phone || '').replace(/[^0-9]/g, '');\nconst waLink = digits ? ('<https://wa.me/' + digits + '|' + c.phone + '>') : '(no phone on the cart)';\n\nconst headline = name + ' ' + (HEAD[i.intent] || 'replied');\n\nconst fields = [\n  { type: 'mrkdwn', text: '*WhatsApp*\\n' + waLink },\n  { type: 'mrkdwn', text: '*Intent*\\n' + (ICON[i.intent] || '\\ud83d\\udcac') + ' ' + i.intent +\n      (i.intent_degraded ? '  \\u26a0 fallback' : '') },\n  { type: 'mrkdwn', text: '*Cart*\\n' + (c.items_summary || '(unknown items)') },\n  { type: 'mrkdwn', text: '*Value*\\n' + (c.total_display || '(unknown total)') },\n  { type: 'mrkdwn', text: '*Status*\\n' + c.cart_status + ' \\u00b7 touch ' + c.touches_sent + ' of 3 sent' },\n  { type: 'mrkdwn', text: '*Language*\\n' + c.language }\n];\n\nconst blocks = [\n  // plain_text, so the header must stay emoji-free - the icon lives in the\n  // Intent field and in the notification fallback instead.\n  { type: 'header', text: { type: 'plain_text', text: headline, emoji: false } },\n  { type: 'section', text: { type: 'mrkdwn', text: '> ' + String(c.inbound_message || '').replace(/\\n/g, '\\n> ') } },\n  { type: 'section', fields: fields }\n];\n\nif (c.recovery_url) {\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '<' + c.recovery_url + '|Open the customer\\u2019s cart>' } });\n}\n\n// The classifier's reasoning goes in a context line rather than a field: it is\n// useful when the owner disagrees with the intent, and noise the rest of the\n// time. A degraded classification is stated in words, never implied by absence.\nconst why = (i.intent_reason ? ('Classifier: ' + i.intent_reason) : 'Classifier: no reason given') +\n  (i.intent_degraded ? '  \\u26a0 classifier unavailable, intent defaulted' : '');\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: why }] });\n\nreturn [{ json: {\n  needs_holding_reply: needsHolding,\n  holding_text: HOLDING[tlang] || HOLDING.en,\n  slack_text: (ICON[i.intent] || '\\ud83d\\udcac') + ' ' + headline + '  \\u2014  ' + (c.phone || 'no phone'),\n  slack_blocks: blocks,\n  intent: i.intent\n} }];\n"
+        },
+        "notes": "Owner gets full cart context; customer gets a static holding line"
+      },
+      {
+        "id": "slack-notify",
+        "name": "Slack Notify Owner",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2380,
+          700
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://slack.com/api/chat.postMessage",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "slackApi",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ channel: '#leads', text: $json.slack_text, blocks: $json.slack_blocks, unfurl_links: false, unfurl_media: false }) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "slackApi": {
+            "id": "du5bPExqejoLC4AW",
+            "name": "Slack account 2"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "if-holding",
+        "name": "Needs Holding Reply",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          2600,
+          700
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-holding",
+                "leftValue": "={{ $('Build Owner Notification').first().json.needs_holding_reply }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "send-holding",
+        "name": "Send Holding Reply",
+        "type": "n8n-nodes-base.twilio",
+        "typeVersion": 1,
+        "position": [
+          2820,
+          620
+        ],
+        "parameters": {
+          "resource": "sms",
+          "operation": "send",
+          "from": "+14155238886",
+          "to": "={{ $('Resolve Reply Context').first().json.phone }}",
+          "toWhatsapp": true,
+          "message": "={{ $('Build Owner Notification').first().json.holding_text }}"
+        },
+        "credentials": {
+          "twilioApi": {
+            "id": "i6W4hkBVTg5L0D9v",
+            "name": "Twilio account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true
+      },
+      {
+        "id": "log-holding-msg",
+        "name": "Log Holding Message",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3040,
+          620
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/cart_messages",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ cart_id: $('Resolve Reply Context').first().json.cart_id, direction: 'outbound', touch_number: null, message: $('Build Owner Notification').first().json.holding_text, twilio_message_id: ($json.sid || null) }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "A holding reply is not a touch - touch_number stays null"
+      },
+      {
+        "id": "log-reply-run",
+        "name": "Log Reply Run",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          3260,
+          700
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; var i = $('Parse Intent').first().json; var n = $('Build Owner Notification').first().json; var sl = $('Slack Notify Owner').first().json; var sb = (sl && sl.body) ? sl.body : sl; var slackOk = !!(sb && sb.ok); var sid = null; var sent = false; try { var t = $('Send Holding Reply').first().json; if (t) { sid = t.sid || null; sent = !!t.sid; } } catch (e) {} return { workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: c.cart_id, status: (slackOk && (!n.needs_holding_reply || sent)) ? 'success' : 'partial', step_name: 'reply_handled', error_message: slackOk ? null : 'slack notification failed', metadata: { checkout_token: c.checkout_token, phone: c.phone, intent: i.intent, intent_reason: i.intent_reason, intent_source: i.intent_source, intent_degraded: i.intent_degraded, intent_detail: i.intent_detail, cart_status: c.cart_status, touches_sent: c.touches_sent, next_touch_at_unchanged: c.next_touch_at, last_inbound_stamped: (function(){ try { var s = $('Stamp Last Inbound').first().json; var sb = (s && s.body !== undefined) ? s.body : s; return Array.isArray(sb) ? sb.length === 1 : false; } catch (e) { return false; } })(), language: c.language, register_zone: c.register_zone, holding_reply_sent: sent, holding_twilio_sid: sid, slack_ok: slackOk } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "next_touch_at is logged to prove the schedule was not touched"
+      },
+      {
+        "id": "if-dupe-inbound",
+        "name": "Is Duplicate Inbound",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          1110,
+          400
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "loose",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "c-409",
+                "leftValue": "={{ $json.statusCode }}",
+                "rightValue": 409,
+                "operator": {
+                  "type": "number",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "notes": "409 = the unique index rejected this MessageSid, i.e. Twilio is retrying a webhook we already handled. TRUE stops here. Any other status (201 on a fresh insert, or a Supabase error) continues: a logging failure must never swallow a real customer reply."
+      },
+      {
+        "id": "log-dupe-inbound",
+        "name": "Log Duplicate Inbound",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1330,
+          620
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; return { workflow_name: '03 - Reply Handler C2', execution_id: $execution.id, cart_id: c.cart_id, status: 'success', step_name: 'duplicate_inbound', metadata: { checkout_token: c.checkout_token, twilio_sid: c.inbound_sid, phone: c.phone, route_it_would_have_taken: c.route, action: 'dropped_no_reply_sent' } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "A dropped duplicate MUST leave a row. 'Nothing happened' is indistinguishable from a webhook that never arrived - the exact silent-loss shape that hid the dead tunnel and the workflow-04 Switch defect in M4. status=success because dropping a retry is correct behaviour, not a failure.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "fd867de2-ea7f-4b4d-8e9d-69e70f35ac17",
+        "name": "Record Phone Suppression",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          2160,
+          180
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/case2_suppressions",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "resolution=ignore-duplicates,return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var c = $('Resolve Reply Context').first().json; var src = c.keyword_hit ? 'keyword' : 'model_intent'; return { phone: c.phone, source: src, cart_id: c.cart_id, keyword_hit: c.keyword_hit || null, note: 'opt-out via workflow 03, execution ' + $execution.id }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "THE COMPLIANCE BOUNDARY. Written BEFORE the cart PATCH on purpose: if the row write failed after the carts were already suppressed, future carts from this phone would be unprotected - the failure that actually matters. This way the worst case is a suppressed phone whose old carts were not patched, and the sweep's case2_due_carts anti-join already excludes those.\n\nphone is the PRIMARY KEY, so a repeat STOP is a no-op: Prefer resolution=ignore-duplicates turns the 409 into a 200.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      },
+      {
+        "id": "stamp-last-inbound",
+        "name": "Stamp Last Inbound",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1165,
+          600
+        ],
+        "parameters": {
+          "method": "PATCH",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "id",
+                "value": "=eq.{{ $('Resolve Reply Context').first().json.cart_id }}"
+              }
+            ]
+          },
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=representation"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ last_inbound_at: $now.toUTC().toISO() }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "notes": "Opens the 24-hour WhatsApp service window on this cart (2026-09-03). Workflow 02 reads it to record whether the next touch would be a free-form session message or a paid Meta template.\n\nWHY IT SITS HERE. Downstream of Is Duplicate Inbound on purpose: a Twilio webhook retry hits the 409 idempotency lock in Log Inbound Message and exits before this node, so a redelivery cannot restamp a window the customer did not reopen. Upstream of Route Reply Path, so every inbound stamps it - including one that turns out to be an opt-out, because the customer did reply either way.\n\nWHY ONLY id=eq. AND NO STATUS GUARD. Every other cart writer in this build filters on status and opted_out, because they move status, next_touch_at or touches_sent and a stale writer can resurrect a closed cart. This one writes a single timestamp and moves none of those, so it cannot resurrect anything, and stamping a cart that closed mid-flight is simply true. Do not 'fix' this by adding the guards - it would silently stop recording replies on exhausted carts, which are exactly the ones a customer answers late.\n\nA failed stamp degrades safely: the column stays null, workflow 02 classifies the next touch as 'template', and the only cost is an over-estimate of template spend.",
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "alwaysOutputData": true
+      }
+    ],
+    "connections": {
+      "Receive Reply Webhook": {
+        "main": [
+          [
+            {
+              "node": "Parse Inbound Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Inbound Message": {
+        "main": [
+          [
+            {
+              "node": "Route Valid Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Valid Inbound": {
+        "main": [
+          [
+            {
+              "node": "Match Cart By Phone",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Skipped Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Match Cart By Phone": {
+        "main": [
+          [
+            {
+              "node": "Resolve Reply Context",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Resolve Reply Context": {
+        "main": [
+          [
+            {
+              "node": "Has Cart Match",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Has Cart Match": {
+        "main": [
+          [
+            {
+              "node": "Log Inbound Message",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log No Cart Match",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Reply Path": {
+        "main": [
+          [
+            {
+              "node": "Log Already Suppressed",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Record Phone Suppression",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Classify Reply Intent (Haiku)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Classify Reply Intent (Haiku)": {
+        "main": [
+          [
+            {
+              "node": "Parse Intent",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Intent": {
+        "main": [
+          [
+            {
+              "node": "Is Opt Out Intent",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Opt Out Intent": {
+        "main": [
+          [
+            {
+              "node": "Record Phone Suppression",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Build Owner Notification",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Suppress Cart": {
+        "main": [
+          [
+            {
+              "node": "Build Opt-Out Confirmation",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Opt-Out Confirmation": {
+        "main": [
+          [
+            {
+              "node": "Send Opt-Out Confirmation",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send Opt-Out Confirmation": {
+        "main": [
+          [
+            {
+              "node": "Log Opt-Out Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Opt-Out Message": {
+        "main": [
+          [
+            {
+              "node": "Log Opt-Out Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Owner Notification": {
+        "main": [
+          [
+            {
+              "node": "Slack Notify Owner",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Slack Notify Owner": {
+        "main": [
+          [
+            {
+              "node": "Needs Holding Reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Needs Holding Reply": {
+        "main": [
+          [
+            {
+              "node": "Send Holding Reply",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Reply Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send Holding Reply": {
+        "main": [
+          [
+            {
+              "node": "Log Holding Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Holding Message": {
+        "main": [
+          [
+            {
+              "node": "Log Reply Run",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log Inbound Message": {
+        "main": [
+          [
+            {
+              "node": "Is Duplicate Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Is Duplicate Inbound": {
+        "main": [
+          [
+            {
+              "node": "Log Duplicate Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Stamp Last Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Record Phone Suppression": {
+        "main": [
+          [
+            {
+              "node": "Suppress Cart",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Stamp Last Inbound": {
+        "main": [
+          [
+            {
+              "node": "Route Reply Path",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "saveExecutionProgress": true,
+      "saveManualExecutions": true
+    },
+    "staticData": null,
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "2d1a9a3b-c272-4269-859f-0bdd2f54e899",
+    "activeVersionId": "2d1a9a3b-c272-4269-859f-0bdd2f54e899",
+    "versionCounter": 15,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-03T21:48:26.550Z",
+        "createdAt": "2026-08-03T21:48:26.550Z",
+        "role": "workflow:owner",
+        "workflowId": "C2ReplyHandlr002",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]

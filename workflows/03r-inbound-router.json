@@ -1,0 +1,795 @@
+[
+  {
+    "updatedAt": "2026-09-02T08:31:26.575Z",
+    "createdAt": "2026-08-03T21:48:22.037Z",
+    "id": "C2RouterInbnd001",
+    "name": "[CS2 Cart] 03r - Inbound Router",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "id": "note-router",
+        "name": "Note - Why this workflow exists",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -320,
+          -40
+        ],
+        "parameters": {
+          "width": 720,
+          "height": 320,
+          "content": "## One Twilio sandbox number, two case studies\nThe Twilio WhatsApp sandbox allows exactly ONE inbound webhook URL, and Case 1 (real estate),\nCase 2 (abandoned cart) and Case 3 (clinic appointments) share the account. Twilio points here; this\nworkflow decides which system owns the conversation and forwards the message unchanged.\n\n**Case 1 is not modified in any way.** It still listens on `/whatsapp-inbound`, and if this router\nis removed the only thing needed to restore the old behaviour is repointing the Twilio URL back.\n\nForwards go to `http://localhost:5678/...` - n8n calling itself INSIDE the container. Deliberately\nnot through the public tunnel: the tunnel is the least reliable component in this stack (four dead\nhostnames so far), and a router that depends on it would drop replies whenever it flaps.\n\nIn a real deployment each client has their own WhatsApp sender and this workflow does not exist."
+        }
+      },
+      {
+        "id": "note-precedence",
+        "name": "Note - Which system owns the phone",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          1120,
+          -40
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 420,
+          "content": "## Which system owns the phone\nThree systems now share one Twilio sandbox number.\n\n| Most recent contact | Routed to | Why |\n|---|---|---|\n| Case 3 appointment `scheduled` / `reminded_*` / `confirmed`, or within 24h after the slot | Case 3 | live appointment - a confirmed patient still cancels, and \"sorry I missed it\" arrives late |\n| Case 3 appointment `opted_out` | Case 3 | a repeat STOP is swallowed by the system that suppressed them |\n| Case 3 waitlist entry `offered` | Case 3 | they are answering an offer we made |\n| Cart pending_verification / abandoned / recovering / exhausted / opted_out | Case 2 | live or suppressed cart conversation |\n| Cart recovered / converted_before_first_touch | Case 1 | the cart is closed, they bought |\n| Nothing at all | Case 1 | unchanged behaviour |\n\n**Case 3 wins a collision** and `multi_case_claim: true` is logged when both want the phone. An\nunprocessed cancel costs a chair that cannot be resold; a misrouted cart reply costs one recovery\nattempt. Not comparable.\n\n**Lookup failure still fails OPEN toward Case 1** - the behaviour from before this workflow existed,\nso an outage degrades instead of dropping the message. Logged as `router_lookup_failed`."
+        }
+      },
+      {
+        "id": "wh-inbound",
+        "name": "Receive WhatsApp Inbound",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
+        "position": [
+          -320,
+          340
+        ],
+        "webhookId": "c2a10d54-6f31-4a6e-9d1e-2f0b7a1c9e01",
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "whatsapp-inbound-router",
+          "responseMode": "onReceived",
+          "options": {}
+        },
+        "notes": "The single URL Twilio is pointed at"
+      },
+      {
+        "id": "parse-inbound",
+        "name": "Parse Inbound Message",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -100,
+          340
+        ],
+        "parameters": {
+          "jsCode": "// Same parser as Case 1's reply handler - deliberately identical, because the\n// forwarded payload has to be interpreted the same way by whichever system\n// receives it.\nconst b = $json.body || $json;\nconst rawFrom = (b.From || b.from || '').toString();\nconst phone = rawFrom.replace(/^whatsapp:/i, '').replace(/[\\s\\-()]/g, '').trim();\nlet message = (b.Body || b.body || '').toString().trim();\nconst sid = (b.MessageSid || b.SmsMessageSid || b.SmsSid || '').toString();\n\n// ---------------------------------------------------------------------------\n// MEDIA (added 2026-08-21). A WhatsApp voice note arrives with an EMPTY Body and\n// NumMedia>=1, so the old `skip = (!phone || !message)` silently dropped it here:\n// the owning case never saw it, the lead got no reply, nothing was written to\n// conversations, and the 48h silence clock kept running - so a lead who HAD\n// answered was nudged and auto-closed for not answering. Voice notes are a\n// dominant WhatsApp modality in the Gulf and Levant, so this was a real hole.\n//\n// Media now counts as a valid inbound. We substitute a descriptive placeholder\n// for the empty body so downstream parsers, transcripts and NOT NULL columns all\n// behave, and pass the media facts along for the owning case to act on.\n// ---------------------------------------------------------------------------\nconst numMedia = parseInt((b.NumMedia || b.numMedia || '0').toString(), 10) || 0;\nconst mediaType = (b.MediaContentType0 || '').toString().toLowerCase();\nconst hasMedia = numMedia > 0;\nlet mediaKind = null;\nif (hasMedia) {\n  if (mediaType.indexOf('audio') === 0) mediaKind = 'voice';\n  else if (mediaType.indexOf('image') === 0) mediaKind = 'image';\n  else if (mediaType.indexOf('video') === 0) mediaKind = 'video';\n  else if (mediaType.indexOf('application/pdf') === 0) mediaKind = 'document';\n  else mediaKind = 'attachment';\n  if (!message) {\n    const label = { voice: '[voice note]', image: '[image]', video: '[video]', document: '[document]', attachment: '[attachment]' };\n    message = label[mediaKind];\n  }\n}\n\nconst skip = (!phone || !message);\n\nreturn [{ json: {\n  inbound_phone: phone,\n  inbound_message: message,\n  inbound_sid: sid,\n  has_media: hasMedia,\n  media_kind: mediaKind,\n  media_type: mediaType || null,\n  num_media: numMedia,\n  skip: skip,\n  original_body: b\n} }];"
+        }
+      },
+      {
+        "id": "if-valid",
+        "name": "Route Valid Inbound",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          120,
+          340
+        ],
+        "parameters": {
+          "conditions": {
+            "options": {
+              "version": 2,
+              "leftValue": "",
+              "caseSensitive": true,
+              "typeValidation": "loose"
+            },
+            "conditions": [
+              {
+                "id": "c-valid",
+                "leftValue": "={{ $json.skip }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "false",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        }
+      },
+      {
+        "id": "log-skipped",
+        "name": "Log Skipped Inbound",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          560
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ workflow_name: '03r - Inbound Router', execution_id: $execution.id, cart_id: null, status: 'success', step_name: 'inbound_skipped', metadata: { phone: $json.inbound_phone || null, reason: 'empty body or missing phone', forwarded_to: null } }) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Nothing is forwarded - neither system can act on an empty message"
+      },
+      {
+        "id": "lookup-cart",
+        "name": "Lookup Recent Cart",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          340
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/carts",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "id,checkout_token,status,touches_sent,opted_out,language,created_at"
+              },
+              {
+                "name": "phone",
+                "value": "=eq.{{ $json.inbound_phone }}"
+              },
+              {
+                "name": "created_at",
+                "value": "=gte.{{ $now.minus({ days: 30 }).toUTC().toISO() }}"
+              },
+              {
+                "name": "order",
+                "value": "created_at.desc"
+              },
+              {
+                "name": "limit",
+                "value": "20"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Candidate carts in 30 days, newest first, bounded at 20 - pickCart in Decide Route chooses which one owns the phone. NOT limit=1: that handed the picker a single row and let a newer CLOSED cart release a phone that an older open cart still owned (2026-09-02)."
+      },
+      {
+        "id": "decide-route",
+        "name": "Decide Route",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          560,
+          340
+        ],
+        "parameters": {
+          "jsCode": "const inbound = $('Parse Inbound Message').first().json;\n\n// Three lookups now. Each is fullResponse + neverError, so a failure arrives as\n// a status code rather than an exception, and each is read through an explicit\n// accessor because an HTTP node replaces the item it processes.\nfunction read(resp) {\n  const httpCode = (resp && resp.statusCode) ? resp.statusCode : 0;\n  const body = resp ? resp.body : null;\n  const ok = (httpCode === 200 && Array.isArray(body));\n  return { ok: ok, code: httpCode, list: ok ? body : [],\n           row: (ok && body.length) ? body[0] : null };\n}\nconst cartR = read($('Lookup Recent Cart').first().json);\nconst apptR = read($('Lookup Case 3 Contact').first().json);\nconst wlR   = read($input.first().json);\n\n// ---------------------------------------------------------------------------\n// WHO OWNS THIS PHONE\n//\n// Case 2 owns it while a cart conversation is LIVE or SUPPRESSED. A finished\n// cart releases the phone back to Case 1. (Unchanged from the original router.)\nconst CASE2_STATUSES = ['pending_verification', 'abandoned', 'recovering', 'exhausted'];\n\n// Case 3 owns it while an appointment is LIVE - which includes 'confirmed',\n// because a confirmed patient still cancels, and it includes the 24 hours AFTER\n// the slot, because \"sorry I missed it, can I rebook\" arrives late by nature.\n// An opted-out patient is also Case 3's: a repeat STOP must be swallowed by the\n// system that suppressed them, never answered by another one.\nconst CASE3_STATUSES = ['scheduled', 'reminded_48h', 'reminded_2h', 'confirmed'];\n// ---------------------------------------------------------------------------\n\n// ---------------------------------------------------------------------------\n// PICK THE LIVE APPOINTMENT, do not trust the first row.\n//\n// A patient legitimately holds several: the one they cancelled on Tuesday and\n// the one they booked for next month. Sorting by appointment_at and taking one\n// returns whichever is EARLIEST, and after a reschedule that is frequently the\n// cancelled one - at which point Case 3 releases the phone and another system\n// answers a patient who is mid-conversation with the clinic.\n//\n// Found live on 2026-08-09: a real `توقف` was routed to Case 1 twice, because\n// the sender's cancelled appointment sorted ahead of their live one. A stop\n// request reaching the wrong system is a compliance failure, not a routing\n// nuisance.\n// ---------------------------------------------------------------------------\nconst CASE3_STATUSES_LIVE = CASE3_STATUSES;\nfunction pickAppointment(list) {\n  if (!list || !list.length) return null;\n  // 1. A live appointment, soonest first - that is the conversation.\n  const live = list.filter(function (r) {\n    return CASE3_STATUSES_LIVE.indexOf(r.status) >= 0 && r.opted_out !== true;\n  }).sort(function (a, b) {\n    return Date.parse(a.appointment_at) - Date.parse(b.appointment_at);\n  });\n  if (live.length) return live[0];\n  // 2. A suppressed row, so a repeat STOP is still swallowed by us.\n  const supp = list.filter(function (r) { return r.opted_out === true; });\n  if (supp.length) return supp[0];\n  // 3. Otherwise the most recent closed row. It carries no claim, but it makes\n  //    the log say WHY the phone was released rather than leaving it blank.\n  return list.slice().sort(function (a, b) {\n    return Date.parse(b.appointment_at) - Date.parse(a.appointment_at);\n  })[0];\n}\n\n// ---------------------------------------------------------------------------\n// PICK THE CART THAT OWNS THE PHONE, do not trust the first row.\n//\n// Exactly the pickAppointment problem, one system over. A customer legitimately\n// holds several carts: the one they converted on Tuesday and the one they are\n// still being messaged about. Sorting by created_at and taking ONE returns the\n// newest, and that is frequently the CLOSED one - at which point Case 2 releases\n// a phone it is still mid-conversation on, and another system answers.\n//\n// Found live on 2026-09-02: a voice note was routed to Case 1 and dropped\n// because the newest of four carts was `converted_before_first_touch`, while an\n// older `exhausted` cart had been sent touch 3 sixty seconds earlier. The\n// compliance version is worse - an `opted_out` cart outranked by a newer closed\n// cart sends a repeat STOP to a system that never suppressed the customer.\n//\n// This ran on `limit=1` for a month and looked correct, because until a phone\n// accumulated a second cart the newest row WAS the only row.\n// ---------------------------------------------------------------------------\nfunction pickCart(list) {\n  if (!list || !list.length) return null;\n  // 1. A cart that still owns the conversation, most recent first.\n  const live = list.filter(function (r) {\n    return CASE2_STATUSES.indexOf(r.status) >= 0 && r.opted_out !== true;\n  }).sort(function (a, b) {\n    return Date.parse(b.created_at) - Date.parse(a.created_at);\n  });\n  if (live.length) return live[0];\n  // 2. A suppressed cart, so a repeat STOP is still swallowed by us.\n  const supp = list.filter(function (r) { return r.opted_out === true; })\n    .sort(function (a, b) { return Date.parse(b.created_at) - Date.parse(a.created_at); });\n  if (supp.length) return supp[0];\n  // 3. Otherwise the most recent closed row. It carries no claim, but it makes\n  //    the log say WHY the phone was released rather than leaving it blank.\n  return list.slice().sort(function (a, b) {\n    return Date.parse(b.created_at) - Date.parse(a.created_at);\n  })[0];\n}\n\nconst cart = pickCart(cartR.list);\nconst appt = pickAppointment(apptR.list);\nconst wl   = wlR.row;\n\nlet case3Claim = null;\nif (appt) {\n  if (appt.opted_out === true) case3Claim = 'appt_opted_out';\n  else if (CASE3_STATUSES.indexOf(appt.status) >= 0) case3Claim = 'appt_' + appt.status;\n}\nif (!case3Claim && wl) case3Claim = 'waitlist_offered';\n\nlet case2Claim = null;\nif (cart) {\n  if (cart.opted_out === true) case2Claim = 'cart_opted_out';\n  else if (CASE2_STATUSES.indexOf(cart.status) >= 0) case2Claim = 'cart_' + cart.status;\n}\n\nlet target, reason;\nif (case3Claim) {\n  // ⚠ CASE 3 WINS A COLLISION, and the collision is logged rather than hidden.\n  //\n  // An unprocessed cancel costs the clinic a chair it cannot resell and leaves a\n  // patient believing they cancelled. A misrouted cart reply costs one recovery\n  // attempt on a cart the customer already abandoned. The two are not\n  // comparable, so the tie goes to the appointment.\n  target = 'case3'; reason = case3Claim;\n} else if (case2Claim) {\n  target = 'case2'; reason = case2Claim;\n} else if (cart) {\n  target = 'case1'; reason = 'cart_closed_' + cart.status;\n} else {\n  target = 'case1'; reason = 'no_recent_cart';\n}\n\n// Fail OPEN, unchanged in spirit: a lookup that did not answer must degrade to\n// the behaviour that existed before it was added, never drop the message. A\n// Case 3 lookup failure therefore falls through to the Case 1/2 logic exactly as\n// it ran yesterday - and says so in the log, so a Supabase blip is never\n// mistaken for \"this patient has no appointment\".\nconst lookupOk = cartR.ok && apptR.ok && wlR.ok;\nif (!lookupOk && !case3Claim && !case2Claim) reason = 'router_lookup_failed';\n\nreturn [{ json: {\n  target: target,\n  route_reason: reason,\n  lookup_ok: lookupOk,\n  lookup_status_code: cartR.code,\n  lookup_codes: cartR.code + '/' + apptR.code + '/' + wlR.code,\n\n  // Both claims are reported on every run, so \"did these two systems ever want\n  // the same phone\" is answerable from run_logs instead of from memory.\n  case2_claim: case2Claim,\n  case3_claim: case3Claim,\n  multi_case_claim: !!(case2Claim && case3Claim),\n\n  cart_id: cart ? cart.id : null,\n  cart_status: cart ? cart.status : null,\n  checkout_token: cart ? cart.checkout_token : null,\n  appointment_id: appt ? appt.id : null,\n  appointment_status: appt ? appt.status : null,\n  waitlist_id: wl ? wl.id : null,\n\n  inbound_phone: inbound.inbound_phone,\n  inbound_sid: inbound.inbound_sid,\n  message_chars: inbound.inbound_message.length\n} }];"
+        },
+        "notes": "Ownership rule lives here, in one readable place"
+      },
+      {
+        "id": "fwd-c2",
+        "name": "Forward To Case 2",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1000,
+          240
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "http://localhost:5678/webhook/whatsapp-inbound-c2",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Parse Inbound Message').first().json.original_body) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "The ORIGINAL Twilio body, unaltered - the handler must not be able to tell"
+      },
+      {
+        "id": "fwd-c1",
+        "name": "Forward To Case 1",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1000,
+          440
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "http://localhost:5678/webhook/whatsapp-inbound",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Parse Inbound Message').first().json.original_body) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Case 1's existing webhook, untouched"
+      },
+      {
+        "id": "log-route",
+        "name": "Log Routing Decision",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1300,
+          340
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/run_logs",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Prefer",
+                "value": "return=minimal"
+              }
+            ]
+          },
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify((function(){ var d = $('Decide Route').first().json; var fwd = $input.first().json; var code = (fwd && fwd.statusCode) ? fwd.statusCode : 0; var delivered = code >= 200 && code < 300; return { workflow_name: '03r - Inbound Router', execution_id: $execution.id, cart_id: d.cart_id, appointment_id: d.appointment_id, status: (delivered && d.lookup_ok) ? 'success' : (delivered ? 'partial' : 'failed'), step_name: 'inbound_routed', error_message: delivered ? null : ('forward to ' + d.target + ' returned HTTP ' + code), metadata: { forwarded_to: d.target, route_reason: d.route_reason, phone: d.inbound_phone, twilio_sid: d.inbound_sid, message_chars: d.message_chars, cart_status: d.cart_status, checkout_token: d.checkout_token, appointment_status: d.appointment_status, waitlist_id: d.waitlist_id, case2_claim: d.case2_claim, case3_claim: d.case3_claim, multi_case_claim: d.multi_case_claim, lookup_ok: d.lookup_ok, lookup_codes: d.lookup_codes, forward_http_code: code } }; })()) }}",
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000,
+        "onError": "continueRegularOutput",
+        "alwaysOutputData": true,
+        "notes": "Every inbound leaves a row: a misroute must never be invisible"
+      },
+      {
+        "id": "Lookup Case 3 Contact",
+        "name": "Lookup Case 3 Contact",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          340,
+          540
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/appointments",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "id,clinic_id,status,opted_out,appointment_at,phone"
+              },
+              {
+                "name": "phone",
+                "value": "=eq.{{ $('Parse Inbound Message').first().json.inbound_phone }}"
+              },
+              {
+                "name": "appointment_at",
+                "value": "=gte.{{ $now.minus({ hours: 24 }).toUTC().toISO() }}"
+              },
+              {
+                "name": "order",
+                "value": "appointment_at.asc"
+              },
+              {
+                "name": "limit",
+                "value": "5"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000
+      },
+      {
+        "id": "Lookup Case 3 Waitlist Offer",
+        "name": "Lookup Case 3 Waitlist Offer",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          540,
+          540
+        ],
+        "parameters": {
+          "method": "GET",
+          "url": "https://YOUR_PROJECT.supabase.co/rest/v1/waitlist",
+          "authentication": "predefinedCredentialType",
+          "nodeCredentialType": "supabaseApi",
+          "sendQuery": true,
+          "queryParameters": {
+            "parameters": [
+              {
+                "name": "select",
+                "value": "id,clinic_id,status,phone"
+              },
+              {
+                "name": "phone",
+                "value": "=eq.{{ $('Parse Inbound Message').first().json.inbound_phone }}"
+              },
+              {
+                "name": "status",
+                "value": "eq.offered"
+              },
+              {
+                "name": "order",
+                "value": "created_at.asc"
+              },
+              {
+                "name": "limit",
+                "value": "1"
+              }
+            ]
+          },
+          "options": {
+            "timeout": 10000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "credentials": {
+          "supabaseApi": {
+            "id": "p3GvX0MPWFrCFb9i",
+            "name": "Supabase account"
+          }
+        },
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000
+      },
+      {
+        "id": "Forward To Case 3",
+        "name": "Forward To Case 3",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1000,
+          60
+        ],
+        "parameters": {
+          "method": "POST",
+          "url": "http://localhost:5678/webhook/whatsapp-inbound-c3",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify($('Parse Inbound Message').first().json.original_body) }}",
+          "options": {
+            "timeout": 15000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true
+              }
+            }
+          }
+        },
+        "onError": "continueRegularOutput",
+        "retryOnFail": true,
+        "maxTries": 2,
+        "waitBetweenTries": 1000
+      },
+      {
+        "id": "Route To Owning Case",
+        "name": "Route To Owning Case",
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3,
+        "position": [
+          780,
+          340
+        ],
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-case3",
+                      "leftValue": "={{ $json.target }}",
+                      "rightValue": "case3",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "case3"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-case2",
+                      "leftValue": "={{ $json.target }}",
+                      "rightValue": "case2",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "case2"
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "version": 2,
+                    "leftValue": "",
+                    "caseSensitive": true,
+                    "typeValidation": "loose"
+                  },
+                  "conditions": [
+                    {
+                      "id": "r-case1",
+                      "leftValue": "={{ $json.target }}",
+                      "rightValue": "case1",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                },
+                "renameOutput": true,
+                "outputKey": "case1"
+              }
+            ]
+          },
+          "options": {
+            "fallbackOutput": 2
+          }
+        }
+      },
+      {
+        "id": "Note - ilgha means two things",
+        "name": "Note - ilgha means two things",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          340,
+          -40
+        ],
+        "parameters": {
+          "width": 700,
+          "height": 300,
+          "content": "## ⚠ إلغاء means opposite things in Case 2 and Case 3\nCase 2 reads `إلغاء` as an **opt-out** — stop messaging me.\nCase 3 reads `إلغاء` as **cancel my appointment** — and keeps sending reminders for anything else.\n\nNothing here reconciles them, and nothing needs to: this router hands each message to exactly ONE\nsystem, so one message only ever gets one interpretation. That makes the routing decision above the\nthing that determines which meaning applies.\n\nCase 3's opt-out words are `توقف` / `STOP` / `UNSUBSCRIBE` / `ARRET` only.\n\nAdded 2026-08-09 with the Case 3 branch (Case 3 M3.1)."
+        }
+      }
+    ],
+    "connections": {
+      "Receive WhatsApp Inbound": {
+        "main": [
+          [
+            {
+              "node": "Parse Inbound Message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Parse Inbound Message": {
+        "main": [
+          [
+            {
+              "node": "Route Valid Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Valid Inbound": {
+        "main": [
+          [
+            {
+              "node": "Lookup Recent Cart",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Log Skipped Inbound",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Lookup Recent Cart": {
+        "main": [
+          [
+            {
+              "node": "Lookup Case 3 Contact",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Decide Route": {
+        "main": [
+          [
+            {
+              "node": "Route To Owning Case",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Forward To Case 2": {
+        "main": [
+          [
+            {
+              "node": "Log Routing Decision",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Forward To Case 1": {
+        "main": [
+          [
+            {
+              "node": "Log Routing Decision",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Lookup Case 3 Contact": {
+        "main": [
+          [
+            {
+              "node": "Lookup Case 3 Waitlist Offer",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Lookup Case 3 Waitlist Offer": {
+        "main": [
+          [
+            {
+              "node": "Decide Route",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route To Owning Case": {
+        "main": [
+          [
+            {
+              "node": "Forward To Case 3",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Forward To Case 2",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Forward To Case 1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Forward To Case 3": {
+        "main": [
+          [
+            {
+              "node": "Log Routing Decision",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Dubai",
+      "errorWorkflow": "9zn3PbSKb9dPxNqp",
+      "saveDataErrorExecution": "all",
+      "saveDataSuccessExecution": "all",
+      "saveExecutionProgress": true,
+      "saveManualExecutions": true
+    },
+    "staticData": null,
+    "meta": null,
+    "nodeGroups": [],
+    "pinData": null,
+    "versionId": "81a5ce16-882d-4d2a-a4fc-8892c40fc3b5",
+    "activeVersionId": "81a5ce16-882d-4d2a-a4fc-8892c40fc3b5",
+    "versionCounter": 10,
+    "triggerCount": 1,
+    "sourceWorkflowId": null,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-08-03T21:48:22.041Z",
+        "createdAt": "2026-08-03T21:48:22.041Z",
+        "role": "workflow:owner",
+        "workflowId": "C2RouterInbnd001",
+        "projectId": "uJ6EDQaWqVXaXtZI",
+        "project": {
+          "updatedAt": "2025-11-10T13:05:51.471Z",
+          "createdAt": "2025-11-10T12:46:35.987Z",
+          "id": "uJ6EDQaWqVXaXtZI",
+          "name": "Hussein Rmaity <hussienremaity@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "customTelemetryTags": [],
+          "creatorId": "937f08f5-776e-4dbd-9f34-a3769190a477"
+        }
+      }
+    ],
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  }
+]
