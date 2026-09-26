@@ -12,7 +12,7 @@ Built for Gulf and Levant Shopify stores whose customers live on WhatsApp and ig
 It runs on the operator's own infrastructure, against their own database, on their own WhatsApp
 number. Self-initiated portfolio project — a real, working system, not a mockup.
 
-**Demo — the same live lead, walked through end to end in both languages:**
+**Demo — walked through end to end in both languages:**
 
 | English walkthrough | العرض بالعربي |
 |---|---|
